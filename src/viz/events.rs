@@ -75,6 +75,7 @@ pub enum VizEvent {
     /// Full system state snapshot for diagram rendering.
     StateSnapshot {
         // Compute state
+        node_label: String,
         read_point: Lsn,
         next_mtr: u64,
         buffer_pool_pages: Vec<PageId>,

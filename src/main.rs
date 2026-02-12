@@ -200,8 +200,6 @@ async fn run_repl() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn run_viz_demo(delay_ms: u64, color: bool) -> anyhow::Result<()> {
-    println!("=== Mini-Aurora Viz Demo ===\n");
-
     let config = VizConfig {
         step_delay: Duration::from_millis(delay_ms),
         color,
@@ -213,48 +211,54 @@ async fn run_viz_demo(delay_ms: u64, color: bool) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&wal_path);
 
     let storage = Arc::new(VizStorageEngine::open(&wal_path, renderer.clone())?);
-    let compute = VizComputeEngine::new(storage.clone(), 256, renderer.clone());
+    let node_a = VizComputeEngine::new(storage.clone(), 256, renderer.clone(), "A".to_string());
+    let node_b = VizComputeEngine::new(storage.clone(), 256, renderer.clone(), "B".to_string());
 
-    // Show initial state
-    storage.emit_state_snapshot(0, 1, Vec::new());
+    // Phase 1: Single Writer — Node A writes pg1, Node B idle
+    node_a.put(1, 0, b"Hello".to_vec()).await?;
 
-    // 1. Write some data
-    compute.put(1, 0, b"Hello, Aurora!".to_vec()).await?;
-    compute.put(2, 0, b"Log is the DB".to_vec()).await?;
+    // Phase 2: Read Isolation — Node B at rp=0 can't see pg1
+    match node_b.get(1).await {
+        Err(_) => { /* expected: page not found at rp=0 */ }
+        Ok(_) => {}
+    }
+    node_b.refresh_read_point().await?;
+    let page = node_b.get(1).await?;
+    println!(
+        "  Node B reads pg1: {:?}",
+        String::from_utf8_lossy(&page[..5])
+    );
 
-    // 2. Read it back
-    let page1 = compute.get(1).await?;
-    let page2 = compute.get(2).await?;
-    println!("  Result — Page 1: {:?}", String::from_utf8_lossy(&page1[..14]));
-    println!("  Result — Page 2: {:?}", String::from_utf8_lossy(&page2[..13]));
+    // Phase 3: Stale Reads & Buffer Independence
+    node_a.put(1, 0, b"World".to_vec()).await?;
+    let page = node_b.get(1).await?; // buffer pool HIT, still "Hello"
+    println!(
+        "  Node B reads pg1 (stale): {:?}",
+        String::from_utf8_lossy(&page[..5])
+    );
+    node_b.refresh_read_point().await?;
+    let page = node_b.get(1).await?; // fresh, sees "World"
+    println!(
+        "  Node B reads pg1 (fresh): {:?}",
+        String::from_utf8_lossy(&page[..5])
+    );
 
-    // 3. Multi-page atomic write
-    compute
+    // Phase 4: Atomic Multi-Page
+    node_a
         .put_multi(vec![
+            (2, 0, b"Page Two".to_vec()),
             (3, 0, b"Page Three".to_vec()),
-            (4, 0, b"Page Four".to_vec()),
-            (5, 0, b"Page Five".to_vec()),
         ])
         .await?;
-
-    // 4. Read multi-page results
-    for pid in 3..=5 {
-        let page = compute.get(pid).await?;
+    node_b.refresh_read_point().await?;
+    for pid in 2..=3 {
+        let page = node_b.get(pid).await?;
         let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
         println!(
-            "  Result — Page {pid}: {:?}",
+            "  Node B reads pg{pid}: {:?}",
             String::from_utf8_lossy(&page[..end])
         );
     }
-
-    // 5. Overwrite to show versioning
-    compute.put(1, 0, b"Redo wins!".to_vec()).await?;
-
-    let page1_new = compute.get(1).await?;
-    println!(
-        "  Result — Page 1 (latest): {:?}",
-        String::from_utf8_lossy(&page1_new[..10])
-    );
 
     // Clean up
     let _ = std::fs::remove_file(&wal_path);
@@ -276,7 +280,7 @@ async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
 
     let wal_path = PathBuf::from("/tmp/mini-aurora-viz-repl.wal");
     let storage = Arc::new(VizStorageEngine::open(&wal_path, renderer.clone())?);
-    let compute = VizComputeEngine::new(storage.clone(), 256, renderer.clone());
+    let compute = VizComputeEngine::new(storage.clone(), 256, renderer.clone(), "A".to_string());
 
     compute.refresh_read_point().await?;
 
@@ -342,7 +346,7 @@ async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
                     Ok(s) => {
                         println!("{s}");
                         let rp = compute.read_point().await;
-                        storage.emit_state_snapshot(rp, 0, Vec::new());
+                        storage.emit_state_snapshot("A".to_string(), rp, 0, Vec::new());
                     }
                     Err(e) => println!("Error: {e}"),
                 }

@@ -17,6 +17,7 @@ pub struct VizComputeEngine {
     storage: Arc<VizStorageEngine>,
     inner: TokioMutex<ComputeInner>,
     renderer: Arc<Mutex<VizRenderer>>,
+    label: String,
 }
 
 struct ComputeInner {
@@ -30,7 +31,9 @@ impl VizComputeEngine {
         storage: Arc<VizStorageEngine>,
         buffer_pool_capacity: usize,
         renderer: Arc<Mutex<VizRenderer>>,
+        label: String,
     ) -> Self {
+        renderer.lock().unwrap().register_node(&label);
         Self {
             storage,
             inner: TokioMutex::new(ComputeInner {
@@ -39,6 +42,7 @@ impl VizComputeEngine {
                 read_point: 0,
             }),
             renderer,
+            label,
         }
     }
 
@@ -52,6 +56,10 @@ impl VizComputeEngine {
 
     fn reset_steps(&self) {
         self.renderer.lock().unwrap().reset_steps(None);
+    }
+
+    fn set_active(&self) {
+        self.renderer.lock().unwrap().set_active_node(&self.label);
     }
 
     /// Write bytes to a page at a given offset. Single-record MTR.
@@ -68,8 +76,10 @@ impl VizComputeEngine {
             });
         }
 
+        self.set_active();
         self.render_op_header(&format!(
-            "PUT pg{page_id} offset={offset} {:?}",
+            "Node {}: PUT pg{page_id} offset={offset} {:?}",
+            self.label,
             String::from_utf8_lossy(&data)
         ));
         self.reset_steps();
@@ -130,7 +140,12 @@ impl VizComputeEngine {
         }
 
         let pages_str: Vec<String> = writes.iter().map(|(pid, _, _)| format!("pg{pid}")).collect();
-        self.render_op_header(&format!("PUT MULTI [{}]", pages_str.join(", ")));
+        self.set_active();
+        self.render_op_header(&format!(
+            "Node {}: PUT MULTI [{}]",
+            self.label,
+            pages_str.join(", ")
+        ));
         self.reset_steps();
 
         let mtr_id = {
@@ -184,7 +199,11 @@ impl VizComputeEngine {
     pub async fn get(&self, page_id: PageId) -> Result<Page, StorageError> {
         let read_point = self.inner.lock().await.read_point;
 
-        self.render_op_header(&format!("GET pg{page_id} @L{read_point}"));
+        self.set_active();
+        self.render_op_header(&format!(
+            "Node {}: GET pg{page_id} @L{read_point}",
+            self.label
+        ));
         self.reset_steps();
 
         // Step: Buffer pool lookup
@@ -227,15 +246,26 @@ impl VizComputeEngine {
     }
 
     pub async fn refresh_read_point(&self) -> Result<Lsn, StorageError> {
+        self.set_active();
+        self.render_op_header(&format!("Node {}: REFRESH read_point", self.label));
+        self.reset_steps();
+
         let state = self.storage.get_durability_state().await?;
         let mut inner = self.inner.lock().await;
+        let old = inner.read_point;
         inner.read_point = state.vdl;
+        drop(inner);
+
+        self.emit(&VizEvent::UpdateReadPoint { old, new: state.vdl });
+        self.emit_state_snapshot().await;
+
         Ok(state.vdl)
     }
 
     async fn emit_state_snapshot(&self) {
         let inner = self.inner.lock().await;
         self.storage.emit_state_snapshot(
+            self.label.clone(),
             inner.read_point,
             inner.next_mtr_id,
             Vec::new(), // BufferPool doesn't expose keys

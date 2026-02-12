@@ -76,6 +76,7 @@ impl VizStorageEngine {
     /// Build and emit a state snapshot event.
     pub fn emit_state_snapshot(
         &self,
+        node_label: String,
         read_point: Lsn,
         next_mtr: u64,
         buffer_pool_pages: Vec<PageId>,
@@ -92,6 +93,7 @@ impl VizStorageEngine {
         };
 
         let event = VizEvent::StateSnapshot {
+            node_label,
             read_point,
             next_mtr,
             buffer_pool_pages,
