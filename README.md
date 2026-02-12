@@ -62,10 +62,75 @@ cargo run -- viz-demo --delay 0          # instant (no pause between steps)
 cargo run -- viz-demo --delay 1000       # 1 second between steps
 cargo run -- viz-demo --no-color         # plain text, no ANSI codes
 
-# Interactive REPL with visualization
+# Interactive REPL with visualization (multi-node, suggestions, bg workers)
 cargo run -- viz-repl
-# Additional REPL commands: viz on|off, delay <ms>
+cargo run -- viz-repl --delay 300
+cargo run -- viz-repl --no-color
 ```
+
+### Viz REPL
+
+The viz-repl is a full interactive concurrency demo with two compute nodes, contextual suggestions, and background workers.
+
+#### Commands
+
+```
+put <page> <offset> <text>          Write to a page
+get <page>                          Read a page
+refresh                             Advance read_point to latest VDL
+node A|B                            Switch active compute node
+state                               Show durability watermarks
+bg <node> write|read|mixed <ms>     Start background worker
+bg stop <node>                      Stop background worker
+bg list                             Show running workers
+viz on|off                          Toggle visualization
+delay <ms>                          Set step delay
+1, 2, 3                             Run suggested command
+quit                                Exit
+```
+
+#### Multi-node
+
+Two compute nodes (A and B) share a single storage engine. Each has its own buffer pool and read point. This demonstrates Aurora's read isolation — Node B won't see Node A's writes until it refreshes its read point.
+
+```
+A> put 1 0 Hello
+A> node B
+B> get 1            # fails — Node B's read_point is 0
+B> refresh          # advance read_point to VDL
+B> get 1            # succeeds — sees "Hello"
+```
+
+#### Suggestions
+
+After each command, numbered shortcuts are displayed. Type `1`, `2`, or `3` to run a suggestion:
+
+```
+A> put 1 0 Hello
+  [1] get 1                 — read the page
+  [2] put 1 0 updated       — overwrite with new data
+  [3] node B                — switch compute node
+A> 1
+>>> get 1
+"Hello"
+```
+
+#### Background workers
+
+Spawn concurrent workers to visualize interleaved operations in real time:
+
+```
+A> bg A write 500           # Node A writes a new page every 500ms
+A> bg B mixed 500           # Node B alternates refresh/get every 500ms
+A> bg list                  # show running workers
+A> bg stop A
+A> bg stop B
+```
+
+Worker kinds:
+- **write** — PUT sequential pages (pg100, pg101, ...) with auto-incrementing IDs
+- **read** — GET cycling through pages 1–10
+- **mixed** — alternates `refresh` and `get`, demonstrating read isolation under concurrent writes
 
 ### Viz mode
 
