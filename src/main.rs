@@ -30,6 +30,34 @@ struct ReplState {
     storage: Arc<VizStorageEngine>,
     renderer: Arc<Mutex<VizRenderer>>,
     bg_page_counter: Arc<AtomicU64>,
+    bg_output_tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+/// RAII guard: suppresses viz rendering while held, restores on drop.
+/// With viz disabled, VizStorageEngine render calls become no-ops (no
+/// thread::sleep under the storage mutex), so operations complete in
+/// microseconds instead of seconds.
+struct VizGuard {
+    renderer: Arc<Mutex<VizRenderer>>,
+    was_enabled: bool,
+}
+
+impl VizGuard {
+    fn suppress(renderer: &Arc<Mutex<VizRenderer>>) -> Self {
+        let was_enabled = {
+            let mut r = renderer.lock().unwrap();
+            let e = r.config_mut().enabled;
+            r.config_mut().enabled = false;
+            e
+        };
+        Self { renderer: renderer.clone(), was_enabled }
+    }
+}
+
+impl Drop for VizGuard {
+    fn drop(&mut self) {
+        self.renderer.lock().unwrap().config_mut().enabled = self.was_enabled;
+    }
 }
 
 struct WorkerHandle {
@@ -351,6 +379,8 @@ async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
     nodes.insert("A".to_string(), node_a);
     nodes.insert("B".to_string(), node_b);
 
+    let (bg_output_tx, mut bg_output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     let mut state = ReplState {
         nodes,
         current_node: "A".to_string(),
@@ -359,6 +389,7 @@ async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
         storage,
         renderer,
         bg_page_counter: Arc::new(AtomicU64::new(100)),
+        bg_output_tx,
     };
 
     // --- Async stdin: OS thread + mpsc channel ---
@@ -389,190 +420,211 @@ async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
     // Print initial suggestions
     print_suggestions(&state);
 
-    // --- Main loop ---
+    // --- Main loop: select on stdin + bg output ---
     loop {
-        let line = match line_rx.recv().await {
-            Some(l) => l,
-            None => break, // stdin closed
-        };
-
-        let trimmed = line.trim().to_string();
-        if trimmed.is_empty() {
-            continue;
+        // Drain any bg output that queued up (e.g. during a slow viz command)
+        while let Ok(msg) = bg_output_rx.try_recv() {
+            println!("{msg}");
         }
 
-        // Check for suggestion shortcut (1, 2, 3)
-        let cmd = if let Ok(n) = trimmed.parse::<usize>() {
-            if n >= 1 && n <= state.suggestions.len() {
-                let resolved = state.suggestions[n - 1].clone();
-                println!(">>> {resolved}");
-                resolved
-            } else {
-                trimmed
-            }
-        } else {
-            trimmed
-        };
+        tokio::select! {
+            biased; // prefer user input over bg output
 
-        let parts: Vec<&str> = cmd.splitn(5, ' ').collect();
-        if parts.is_empty() || parts[0].is_empty() {
-            continue;
-        }
+            line = line_rx.recv() => {
+                let line = match line {
+                    Some(l) => l,
+                    None => break,
+                };
 
-        let outcome = match parts[0] {
-            "put" => {
-                if parts.len() < 4 {
-                    println!("Usage: put <page_id> <offset> <text>");
-                    CommandOutcome::None
-                } else {
-                    let page_id: PageId = match parts[1].parse() {
-                        Ok(v) => v,
-                        Err(_) => { println!("Invalid page_id"); continue; }
-                    };
-                    let offset: u16 = match parts[2].parse() {
-                        Ok(v) => v,
-                        Err(_) => { println!("Invalid offset"); continue; }
-                    };
-                    let data = parts[3].as_bytes().to_vec();
-                    if let Some(w) = state.workers.get(&state.current_node) {
-                        println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
-                    }
-                    let compute = state.nodes[&state.current_node].clone();
-                    match compute.put(page_id, offset, data).await {
-                        Ok(vdl) => {
-                            println!("OK (VDL={vdl})");
-                            CommandOutcome::Put { page_id }
-                        }
-                        Err(e) => {
-                            println!("Error: {e}");
-                            CommandOutcome::None
-                        }
-                    }
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
                 }
-            }
-            "get" => {
-                if parts.len() < 2 {
-                    println!("Usage: get <page_id>");
-                    CommandOutcome::None
-                } else {
-                    let page_id: PageId = match parts[1].parse() {
-                        Ok(v) => v,
-                        Err(_) => { println!("Invalid page_id"); continue; }
-                    };
-                    if let Some(w) = state.workers.get(&state.current_node) {
-                        println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
-                    }
-                    let compute = state.nodes[&state.current_node].clone();
-                    match compute.get(page_id).await {
-                        Ok(page) => {
-                            let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
-                            if end == 0 {
-                                println!("(empty page)");
-                            } else {
-                                println!("{:?}", String::from_utf8_lossy(&page[..end]));
-                            }
-                            CommandOutcome::GetSuccess { page_id }
-                        }
-                        Err(e) => {
-                            println!("Error: {e}");
-                            CommandOutcome::GetFailure { page_id }
-                        }
-                    }
-                }
-            }
-            "refresh" => {
-                let compute = state.nodes[&state.current_node].clone();
-                match compute.refresh_read_point().await {
-                    Ok(rp) => println!("read_point -> {rp}"),
-                    Err(e) => println!("Error: {e}"),
-                }
-                CommandOutcome::Refresh
-            }
-            "node" => {
-                if parts.len() < 2 {
-                    println!("Usage: node A|B");
-                    CommandOutcome::None
-                } else {
-                    let target = parts[1].to_uppercase();
-                    if state.nodes.contains_key(&target) {
-                        state.current_node = target;
-                        *prompt_str.lock().unwrap() = format!("{}> ", state.current_node);
-                        println!("Switched to Node {}", state.current_node);
-                        CommandOutcome::NodeSwitch
+
+                // Check for suggestion shortcut (1, 2, 3)
+                let cmd = if let Ok(n) = trimmed.parse::<usize>() {
+                    if n >= 1 && n <= state.suggestions.len() {
+                        let resolved = state.suggestions[n - 1].clone();
+                        println!(">>> {resolved}");
+                        resolved
                     } else {
-                        println!("Unknown node: {}. Available: A, B", parts[1]);
+                        trimmed
+                    }
+                } else {
+                    trimmed
+                };
+
+                let parts: Vec<&str> = cmd.splitn(5, ' ').collect();
+                if parts.is_empty() || parts[0].is_empty() {
+                    continue;
+                }
+
+                let outcome = match parts[0] {
+                    "put" => {
+                        if parts.len() < 4 {
+                            println!("Usage: put <page_id> <offset> <text>");
+                            CommandOutcome::None
+                        } else {
+                            let page_id: PageId = match parts[1].parse() {
+                                Ok(v) => v,
+                                Err(_) => { println!("Invalid page_id"); continue; }
+                            };
+                            let offset: u16 = match parts[2].parse() {
+                                Ok(v) => v,
+                                Err(_) => { println!("Invalid offset"); continue; }
+                            };
+                            let data = parts[3].as_bytes().to_vec();
+                            if let Some(w) = state.workers.get(&state.current_node) {
+                                println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
+                            }
+                            let compute = state.nodes[&state.current_node].clone();
+                            match compute.put(page_id, offset, data).await {
+                                Ok(vdl) => {
+                                    println!("OK (VDL={vdl})");
+                                    CommandOutcome::Put { page_id }
+                                }
+                                Err(e) => {
+                                    println!("Error: {e}");
+                                    CommandOutcome::None
+                                }
+                            }
+                        }
+                    }
+                    "get" => {
+                        if parts.len() < 2 {
+                            println!("Usage: get <page_id>");
+                            CommandOutcome::None
+                        } else {
+                            let page_id: PageId = match parts[1].parse() {
+                                Ok(v) => v,
+                                Err(_) => { println!("Invalid page_id"); continue; }
+                            };
+                            if let Some(w) = state.workers.get(&state.current_node) {
+                                println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
+                            }
+                            let compute = state.nodes[&state.current_node].clone();
+                            match compute.get(page_id).await {
+                                Ok(page) => {
+                                    let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
+                                    if end == 0 {
+                                        println!("(empty page)");
+                                    } else {
+                                        println!("{:?}", String::from_utf8_lossy(&page[..end]));
+                                    }
+                                    CommandOutcome::GetSuccess { page_id }
+                                }
+                                Err(e) => {
+                                    println!("Error: {e}");
+                                    CommandOutcome::GetFailure { page_id }
+                                }
+                            }
+                        }
+                    }
+                    "refresh" => {
+                        let compute = state.nodes[&state.current_node].clone();
+                        match compute.refresh_read_point().await {
+                            Ok(rp) => println!("read_point -> {rp}"),
+                            Err(e) => println!("Error: {e}"),
+                        }
+                        CommandOutcome::Refresh
+                    }
+                    "node" => {
+                        if parts.len() < 2 {
+                            println!("Usage: node A|B");
+                            CommandOutcome::None
+                        } else {
+                            let target = parts[1].to_uppercase();
+                            if state.nodes.contains_key(&target) {
+                                state.current_node = target;
+                                *prompt_str.lock().unwrap() = format!("{}> ", state.current_node);
+                                println!("Switched to Node {}", state.current_node);
+                                CommandOutcome::NodeSwitch
+                            } else {
+                                println!("Unknown node: {}. Available: A, B", parts[1]);
+                                CommandOutcome::None
+                            }
+                        }
+                    }
+                    "state" => {
+                        match state.storage.get_durability_state().await {
+                            Ok(s) => {
+                                println!("{s}");
+                                let compute = state.nodes[&state.current_node].clone();
+                                let rp = compute.read_point().await;
+                                state.storage.emit_state_snapshot(
+                                    state.current_node.clone(), rp, 0, Vec::new(),
+                                );
+                            }
+                            Err(e) => println!("Error: {e}"),
+                        }
                         CommandOutcome::None
                     }
-                }
-            }
-            "state" => {
-                match state.storage.get_durability_state().await {
-                    Ok(s) => {
-                        println!("{s}");
-                        let compute = state.nodes[&state.current_node].clone();
-                        let rp = compute.read_point().await;
-                        state.storage.emit_state_snapshot(
-                            state.current_node.clone(), rp, 0, Vec::new(),
-                        );
+                    "bg" => {
+                        handle_bg_command(&parts, &mut state).await
                     }
-                    Err(e) => println!("Error: {e}"),
-                }
-                CommandOutcome::None
-            }
-            "bg" => {
-                handle_bg_command(&parts, &mut state).await
-            }
-            "viz" => {
-                if parts.len() < 2 {
-                    println!("Usage: viz on|off");
-                } else {
-                    match parts[1] {
-                        "on" => {
-                            state.renderer.lock().unwrap().config_mut().enabled = true;
-                            println!("Visualization enabled.");
+                    "viz" => {
+                        if parts.len() < 2 {
+                            println!("Usage: viz on|off");
+                        } else {
+                            match parts[1] {
+                                "on" => {
+                                    state.renderer.lock().unwrap().config_mut().enabled = true;
+                                    println!("Visualization enabled.");
+                                }
+                                "off" => {
+                                    state.renderer.lock().unwrap().config_mut().enabled = false;
+                                    println!("Visualization disabled.");
+                                }
+                                _ => println!("Usage: viz on|off"),
+                            }
                         }
-                        "off" => {
-                            state.renderer.lock().unwrap().config_mut().enabled = false;
-                            println!("Visualization disabled.");
-                        }
-                        _ => println!("Usage: viz on|off"),
+                        CommandOutcome::None
                     }
-                }
-                CommandOutcome::None
-            }
-            "delay" => {
-                if parts.len() < 2 {
-                    println!("Usage: delay <ms>");
-                } else {
-                    match parts[1].parse::<u64>() {
-                        Ok(ms) => {
-                            state.renderer.lock().unwrap().config_mut().step_delay =
-                                Duration::from_millis(ms);
-                            println!("Step delay set to {ms}ms.");
+                    "delay" => {
+                        if parts.len() < 2 {
+                            println!("Usage: delay <ms>");
+                        } else {
+                            match parts[1].parse::<u64>() {
+                                Ok(ms) => {
+                                    state.renderer.lock().unwrap().config_mut().step_delay =
+                                        Duration::from_millis(ms);
+                                    println!("Step delay set to {ms}ms.");
+                                }
+                                Err(_) => println!("Invalid delay value"),
+                            }
                         }
-                        Err(_) => println!("Invalid delay value"),
+                        CommandOutcome::None
                     }
-                }
-                CommandOutcome::None
-            }
-            "quit" | "exit" | "q" => {
-                // Cancel all workers before exiting
-                for (label, handle) in state.workers.drain() {
-                    handle.cancel.cancel();
-                    let _ = handle.task.await;
-                    println!("Stopped bg worker on Node {label}");
-                }
-                break;
-            }
-            other => {
-                println!("Unknown command: {other}");
-                CommandOutcome::None
-            }
-        };
+                    "quit" | "exit" | "q" => {
+                        for (label, handle) in state.workers.drain() {
+                            handle.cancel.cancel();
+                            let _ = handle.task.await;
+                            println!("Stopped bg worker on Node {label}");
+                        }
+                        break;
+                    }
+                    other => {
+                        println!("Unknown command: {other}");
+                        CommandOutcome::None
+                    }
+                };
 
-        // Generate suggestions based on outcome
-        update_suggestions(&mut state, &outcome);
-        print_suggestions(&state);
+                // Drain bg output that accumulated during the (possibly slow) viz command
+                while let Ok(msg) = bg_output_rx.try_recv() {
+                    println!("{msg}");
+                }
+
+                update_suggestions(&mut state, &outcome);
+                print_suggestions(&state);
+            }
+
+            // Stream bg output while idle (user hasn't pressed Enter yet)
+            msg = bg_output_rx.recv() => {
+                if let Some(msg) = msg {
+                    println!("{msg}");
+                }
+            }
+        }
     }
 
     println!("Bye!");
@@ -735,11 +787,22 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
             }
 
             let cancel = CancellationToken::new();
-            let compute = state.nodes[&target].clone();
             let bg_counter = state.bg_page_counter.clone();
             let cancel_clone = cancel.clone();
             let node_label = target.clone();
             let renderer_for_bg = state.renderer.clone();
+            let bg_tx = state.bg_output_tx.clone();
+
+            // Non-viz ComputeEngine: shares storage but never touches the
+            // renderer at the compute level (no set_active, no render_op_header,
+            // no event emissions). Storage-level renders are suppressed via
+            // VizGuard so the storage mutex is held for microseconds, not seconds.
+            let storage_for_bg: Arc<dyn StorageApi> = state.storage.clone();
+            let bg_compute = ComputeEngine::new(storage_for_bg, 256);
+            {
+                let _guard = VizGuard::suppress(&state.renderer);
+                let _ = bg_compute.refresh_read_point().await;
+            }
 
             let task = tokio::spawn(async move {
                 let mut cycle: u64 = 0;
@@ -748,49 +811,20 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
                         break;
                     }
 
-                    // Suppress viz rendering so bg ops don't hold the storage
-                    // mutex for seconds (each render event calls thread::sleep).
-                    // With viz disabled, operations complete in microseconds.
-                    let was_enabled = {
-                        let mut r = renderer_for_bg.lock().unwrap();
-                        let e = r.config_mut().enabled;
-                        r.config_mut().enabled = false;
-                        e
-                    };
-
-                    match kind {
-                        WorkerKind::Write => {
-                            let pg = bg_counter.fetch_add(1, Ordering::Relaxed);
-                            match compute.put(pg, 0, format!("bg-{pg}").into_bytes()).await {
-                                Ok(vdl) => println!("[bg {node_label}] PUT pg{pg} OK (VDL={vdl})"),
-                                Err(e) => println!("[bg {node_label}] PUT pg{pg} Error: {e}"),
-                            }
-                        }
-                        WorkerKind::Read => {
-                            let pg = (cycle % 10) + 1;
-                            match compute.get(pg).await {
-                                Ok(page) => {
-                                    let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
-                                    let preview = if end == 0 {
-                                        "(empty)".to_string()
-                                    } else {
-                                        let s = String::from_utf8_lossy(&page[..end.min(20)]);
-                                        format!("{:?}", s)
-                                    };
-                                    println!("[bg {node_label}] GET pg{pg} -> {preview}");
+                    // Scope the VizGuard so viz is restored before the sleep
+                    {
+                        let _guard = VizGuard::suppress(&renderer_for_bg);
+                        match kind {
+                            WorkerKind::Write => {
+                                let pg = bg_counter.fetch_add(1, Ordering::Relaxed);
+                                match bg_compute.put(pg, 0, format!("bg-{pg}").into_bytes()).await {
+                                    Ok(vdl) => { let _ = bg_tx.send(format!("[bg {node_label}] PUT pg{pg} OK (VDL={vdl})")); }
+                                    Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] PUT pg{pg} Error: {e}")); }
                                 }
-                                Err(e) => println!("[bg {node_label}] GET pg{pg} Error: {e}"),
                             }
-                        }
-                        WorkerKind::Mixed => {
-                            if cycle % 2 == 0 {
-                                match compute.refresh_read_point().await {
-                                    Ok(rp) => println!("[bg {node_label}] REFRESH -> rp={rp}"),
-                                    Err(e) => println!("[bg {node_label}] REFRESH Error: {e}"),
-                                }
-                            } else {
-                                let pg = ((cycle / 2) % 10) + 1;
-                                match compute.get(pg).await {
+                            WorkerKind::Read => {
+                                let pg = (cycle % 10) + 1;
+                                match bg_compute.get(pg).await {
                                     Ok(page) => {
                                         let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
                                         let preview = if end == 0 {
@@ -799,16 +833,36 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
                                             let s = String::from_utf8_lossy(&page[..end.min(20)]);
                                             format!("{:?}", s)
                                         };
-                                        println!("[bg {node_label}] GET pg{pg} -> {preview}");
+                                        let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} -> {preview}"));
                                     }
-                                    Err(e) => println!("[bg {node_label}] GET pg{pg} Error: {e}"),
+                                    Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} Error: {e}")); }
+                                }
+                            }
+                            WorkerKind::Mixed => {
+                                if cycle % 2 == 0 {
+                                    match bg_compute.refresh_read_point().await {
+                                        Ok(rp) => { let _ = bg_tx.send(format!("[bg {node_label}] REFRESH -> rp={rp}")); }
+                                        Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] REFRESH Error: {e}")); }
+                                    }
+                                } else {
+                                    let pg = ((cycle / 2) % 10) + 1;
+                                    match bg_compute.get(pg).await {
+                                        Ok(page) => {
+                                            let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
+                                            let preview = if end == 0 {
+                                                "(empty)".to_string()
+                                            } else {
+                                                let s = String::from_utf8_lossy(&page[..end.min(20)]);
+                                                format!("{:?}", s)
+                                            };
+                                            let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} -> {preview}"));
+                                        }
+                                        Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} Error: {e}")); }
+                                    }
                                 }
                             }
                         }
-                    }
-
-                    // Restore viz state so user commands still render
-                    renderer_for_bg.lock().unwrap().config_mut().enabled = was_enabled;
+                    } // _guard dropped: viz restored before sleep
 
                     cycle += 1;
                     tokio::select! {
