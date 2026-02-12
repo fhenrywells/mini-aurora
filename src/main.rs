@@ -739,6 +739,7 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
             let bg_counter = state.bg_page_counter.clone();
             let cancel_clone = cancel.clone();
             let node_label = target.clone();
+            let renderer_for_bg = state.renderer.clone();
 
             let task = tokio::spawn(async move {
                 let mut cycle: u64 = 0;
@@ -746,6 +747,17 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
                     if cancel_clone.is_cancelled() {
                         break;
                     }
+
+                    // Suppress viz rendering so bg ops don't hold the storage
+                    // mutex for seconds (each render event calls thread::sleep).
+                    // With viz disabled, operations complete in microseconds.
+                    let was_enabled = {
+                        let mut r = renderer_for_bg.lock().unwrap();
+                        let e = r.config_mut().enabled;
+                        r.config_mut().enabled = false;
+                        e
+                    };
+
                     match kind {
                         WorkerKind::Write => {
                             let pg = bg_counter.fetch_add(1, Ordering::Relaxed);
@@ -755,7 +767,6 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
                             }
                         }
                         WorkerKind::Read => {
-                            // Cycle through pages 1..
                             let pg = (cycle % 10) + 1;
                             match compute.get(pg).await {
                                 Ok(page) => {
@@ -795,6 +806,10 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
                             }
                         }
                     }
+
+                    // Restore viz state so user commands still render
+                    renderer_for_bg.lock().unwrap().config_mut().enabled = was_enabled;
+
                     cycle += 1;
                     tokio::select! {
                         _ = cancel_clone.cancelled() => break,
