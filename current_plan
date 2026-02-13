@@ -1,0 +1,363 @@
+# Evolving Aurora: Customer-Driven System Variants
+
+## Context
+
+mini-aurora implements Aurora's "log is the database" architecture. We're adding a **variant showcase** — the same base system can run with `--preset base|tiered|burst|multitenant` to demonstrate how different customer pressures drive different architectural tradeoffs, with before/after metrics for each.
+
+**Scope of this plan:** Phase 1 (metrics/instrumentation prerequisite) + Phase 2 (tiered storage variant). Burst and multi-tenant variants come later.
+
+**Decisions made:**
+- Simulated S3 (local hot/cold directories + artificial latency, no MinIO)
+- Single binary with `--preset` flag (not git branches or cargo features)
+- Tiered storage is the first variant after metrics
+
+---
+
+## Phase 1: Metrics + Instrumentation + Scenarios
+
+### 1.1 Add Serialize to VizEvent
+
+**File:** `src/viz/events.rs`
+- Add `#[derive(serde::Serialize)]` to `VizEvent` enum
+- All existing variant fields (u64, bool, Vec<u8>, HashMap<u64,u64>, Option<_>) are serializable
+
+**File:** `Cargo.toml`
+- Add `serde = { version = "1", features = ["derive"] }` and `serde_json = "1"` to `[dependencies]`
+- Add `toml = "0.8"` (for scenarios)
+
+### 1.2 MetricsCollector
+
+**New file:** `src/viz/metrics.rs`
+
+```rust
+pub struct MetricsCollector {
+    write_count: u64,
+    read_count: u64,
+    page_cache_hits: u64,
+    page_cache_misses: u64,
+    buffer_pool_hits: u64,
+    buffer_pool_misses: u64,
+    materialize_count: u64,
+    materialize_total_us: u64,     // accumulated microseconds
+    wal_bytes_written: u64,
+    start_time: Instant,
+}
+```
+
+Methods: `new()`, `record_event(&mut self, &VizEvent)`, `summary() -> MetricsSummary`, `reset()`
+
+`MetricsSummary` has `impl Display` printing:
+```
+Writes: 150 | Reads: 200 | Cache hit: 78% | Materializations: 44
+WAL: 48 KB | VCL=150 VDL=150 | Uptime: 12.3s
+```
+
+**Integration:** Add `metrics: Option<MetricsCollector>` field to `VizRenderer`. Call `metrics.record_event(event)` at the top of `render()`, *before* the `if !enabled { return }` check.
+
+### 1.3 JSON Tracer
+
+**New file:** `src/viz/tracer.rs`
+
+```rust
+pub struct JsonTracer {
+    writer: BufWriter<File>,
+    seq: u64,
+    start: Instant,
+}
+```
+
+Writes one line-delimited JSON entry per event: `{"seq":1,"timestamp_us":1234,"event":{...}}`
+
+**Integration:** Add `tracer: Option<JsonTracer>` field to `VizRenderer`. Call `tracer.trace(event)` at the top of `render()`, before the enabled check.
+
+**File:** `src/viz/mod.rs` — add `pub mod metrics; pub mod tracer;`
+
+### 1.4 CLI flags and commands
+
+**File:** `src/main.rs`
+
+New flags:
+- `--trace-json <path>` — enable JSON trace output to file
+- `--preset base|tiered` — select engine variant (default: base)
+
+New REPL command:
+- `metrics` — prints `MetricsSummary` from renderer
+
+New CLI mode:
+- `scenario <file.toml> [--preset X] [--trace-json path]` — run a scripted workload
+
+### 1.5 Scenario runner
+
+**New file:** `src/scenario.rs`
+
+```rust
+#[derive(Deserialize)]
+pub struct Scenario {
+    pub meta: ScenarioMeta,
+    pub steps: Vec<ScenarioStep>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op")]
+pub enum ScenarioStep {
+    #[serde(rename = "put")]
+    Put { page_id: u64, offset: u16, data: String, node: Option<String> },
+    #[serde(rename = "get")]
+    Get { page_id: u64, node: Option<String> },
+    #[serde(rename = "refresh")]
+    Refresh { node: Option<String> },
+    #[serde(rename = "sleep_ms")]
+    SleepMs { value: u64 },
+    #[serde(rename = "repeat")]
+    Repeat { count: u64, steps: Vec<ScenarioStep> },
+}
+```
+
+Executor: `pub async fn run_scenario(scenario, storage, nodes) -> Result<()>`
+
+### 1.6 Scenario files
+
+**New directory:** `scenarios/`
+
+- `scenarios/burst.toml` — 50 rapid writes then reads (tests WAL throughput, cache churn)
+- `scenarios/cold_reads.toml` — write 100 pages, read all (tests cache miss rate, materialization)
+- `scenarios/noisy_neighbor.toml` — Node A heavy writes, Node B reads with stale read point
+
+---
+
+## Phase 2: Tiered Storage Variant (`--preset tiered`)
+
+### 2.1 Core types
+
+**New file:** `crates/wal/src/segment.rs`
+
+```rust
+pub type SegmentId = u32;
+
+#[derive(Serialize, Deserialize)]
+pub enum Tier { Hot, Cold }
+
+#[derive(Serialize, Deserialize)]
+pub struct SegmentMeta {
+    pub id: SegmentId,
+    pub filename: String,
+    pub tier: Tier,
+    pub lsn_range: (Lsn, Lsn),
+    pub size_bytes: u64,
+    pub sealed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct LsnLocation {
+    pub segment_id: SegmentId,
+    pub file_offset: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Manifest {
+    pub segments: Vec<SegmentMeta>,
+    pub next_segment_id: SegmentId,
+}
+```
+
+**File:** `crates/wal/src/lib.rs` — add `pub mod segment;`
+**File:** `crates/wal/Cargo.toml` — add `serde`, `serde_json`
+
+### 2.2 SegmentManager
+
+**File:** `crates/wal/src/segment.rs` (continued)
+
+```rust
+pub struct SegmentManager {
+    hot_dir: PathBuf,
+    cold_dir: PathBuf,
+    manifest: Manifest,
+    active_writer: WalWriter,
+    active_segment_id: SegmentId,
+    active_first_lsn: Option<Lsn>,
+    active_bytes_written: u64,
+    max_segment_bytes: u64,
+    cold_latency: Duration,
+}
+```
+
+Key methods:
+- `open(base_dir, config) -> Result<Self>` — load manifest, open head segment writer
+- `append_batch(records) -> Result<Vec<LsnLocation>>` — write records, rotate if needed
+- `rotate()` — seal current segment, update manifest (atomic: tmp + rename), open new segment
+- `sync()` — fsync active writer
+- `open_segment_reader(segment_id) -> Result<(WalReader, Tier)>` — for chain walking
+- `cool_segments(keep_hot: usize)` — move old sealed segments from hot/ to cold/
+- `recover() -> Result<(page_index, lsn_offsets, durability)>` — scan segments to rebuild indexes
+
+Segment naming: `wal_000001.seg`, `wal_000002.seg`, etc.
+Manifest: `manifest.json` with atomic write (temp + rename).
+
+### 2.3 Storage engine dual-mode dispatch
+
+**New file:** `crates/storage/src/config.rs`
+
+```rust
+pub enum StoragePreset { Base, Tiered(TieredConfig) }
+
+pub struct TieredConfig {
+    pub segment_size_bytes: u64,     // e.g. 64KB for demos
+    pub cold_latency: Duration,      // e.g. 50ms
+    pub base_dir: PathBuf,
+}
+```
+
+**File:** `crates/storage/src/engine.rs`
+
+Add backend enum inside `Inner`:
+```rust
+enum WalBackend {
+    SingleFile {
+        wal_path: PathBuf,
+        writer: WalWriter,
+        lsn_offsets: HashMap<Lsn, u64>,
+    },
+    Segmented {
+        manager: SegmentManager,
+        lsn_offsets: HashMap<Lsn, LsnLocation>,
+    },
+}
+```
+
+- **`open(wal_path)`** unchanged — creates `WalBackend::SingleFile` (all 50+ tests pass as-is)
+- **`open_with_preset(preset)`** — new method, creates the appropriate backend
+- **`append_redo`** — dispatch on backend: SingleFile uses existing logic, Segmented calls `manager.append_batch()`
+- **`get_page`** — dispatch on backend: SingleFile uses existing chain walk, Segmented uses `collect_segmented_chain()` which opens readers per-segment and injects cold latency via `thread::sleep`
+
+### 2.4 Cross-segment chain walking
+
+Helper function in `crates/storage/src/engine.rs`:
+
+```rust
+fn collect_segmented_chain(
+    page_id: PageId,
+    start_lsn: Lsn,
+    target_lsn: Lsn,
+    lsn_offsets: &HashMap<Lsn, LsnLocation>,
+    manager: &SegmentManager,
+) -> Result<Vec<RedoRecord>, StorageError>
+```
+
+Walks backward via `prev_lsn`. Reuses reader if consecutive reads hit the same segment. Injects `thread::sleep(cold_latency)` on first read from a cold segment (sync, not async — we're already under `Mutex<Inner>`).
+
+### 2.5 New VizEvent variants
+
+**File:** `src/viz/events.rs`
+
+```rust
+SegmentRotation { sealed_id: u32, new_id: u32, sealed_lsn_range: (u64, u64) },
+ColdTierRead { segment_id: u32, latency_ms: u64 },
+SegmentCooled { segment_id: u32 },
+```
+
+### 2.6 VizStorageEngine tiered support
+
+**File:** `src/viz/engine.rs`
+
+Add `open_tiered(config, renderer)` constructor. The viz engine wraps the same `WalBackend::Segmented` path but emits the new tiered `VizEvent`s around segment rotation and cold reads.
+
+### 2.7 CLI integration
+
+**File:** `src/main.rs`
+
+```bash
+cargo run -- viz-repl --preset tiered --cold-latency-ms 50
+cargo run -- scenario scenarios/cold_reads.toml --preset tiered --trace-json /tmp/tiered.jsonl
+```
+
+---
+
+## Files Summary
+
+### Phase 1 — Modify
+| File | Change |
+|------|--------|
+| `Cargo.toml` | Add `serde`, `serde_json`, `toml` deps |
+| `src/viz/events.rs` | Add `Serialize` derive to `VizEvent` |
+| `src/viz/renderer.rs` | Add `metrics` + `tracer` fields, call in `render()` |
+| `src/viz/mod.rs` | Add `pub mod metrics; pub mod tracer;` |
+| `src/main.rs` | Add `--trace-json`, `--preset` flags, `metrics` command, `scenario` mode |
+
+### Phase 1 — Create
+| File | Purpose |
+|------|---------|
+| `src/viz/metrics.rs` | MetricsCollector + MetricsSummary |
+| `src/viz/tracer.rs` | JSON line tracer |
+| `src/scenario.rs` | TOML scenario parser + executor |
+| `scenarios/burst.toml` | Burst write workload |
+| `scenarios/cold_reads.toml` | Cold read workload |
+| `scenarios/noisy_neighbor.toml` | Multi-node contention workload |
+
+### Phase 2 — Modify
+| File | Change |
+|------|--------|
+| `crates/wal/Cargo.toml` | Add `serde`, `serde_json` |
+| `crates/wal/src/lib.rs` | Add `pub mod segment;` |
+| `crates/storage/src/lib.rs` | Add `pub mod config;` |
+| `crates/storage/src/engine.rs` | `WalBackend` enum, dual-mode dispatch, `open_with_preset()` |
+| `src/viz/events.rs` | Add tiered VizEvent variants |
+| `src/viz/engine.rs` | Add `open_tiered()`, emit tiered events |
+| `src/main.rs` | `--preset tiered`, `--cold-latency-ms` flags |
+
+### Phase 2 — Create
+| File | Purpose |
+|------|---------|
+| `crates/wal/src/segment.rs` | SegmentManager, Manifest, LsnLocation types |
+| `crates/storage/src/config.rs` | StoragePreset, TieredConfig |
+| `tests/phase2_tests.rs` | Tiered-specific integration tests |
+
+---
+
+## Implementation Order
+
+### Phase 1 (do first — prerequisite for all variants)
+1. Add dependencies to `Cargo.toml`
+2. Add `Serialize` to `VizEvent`
+3. Create `src/viz/metrics.rs`
+4. Create `src/viz/tracer.rs`
+5. Update `src/viz/mod.rs`
+6. Integrate metrics + tracer into `VizRenderer::render()`
+7. Add `--trace-json` flag + `metrics` REPL command to `src/main.rs`
+8. Create `src/scenario.rs` (parser + executor)
+9. Add `scenario` CLI mode to `src/main.rs`
+10. Create scenario TOML files
+11. `cargo test --workspace` — verify no regressions
+
+### Phase 2 (tiered storage variant)
+1. Add serde deps to `crates/wal/Cargo.toml`
+2. Create `crates/wal/src/segment.rs` (types + SegmentManager)
+3. Create `crates/storage/src/config.rs` (StoragePreset + TieredConfig)
+4. Refactor `crates/storage/src/engine.rs` (WalBackend enum, keep `open()` unchanged)
+5. Implement cross-segment chain walking
+6. Implement `SegmentManager::recover()`
+7. `cargo test --workspace` — all 50+ existing tests still pass
+8. Add tiered VizEvent variants
+9. Update `VizStorageEngine` with `open_tiered()`
+10. Add `--preset tiered` + `--cold-latency-ms` to `src/main.rs`
+11. Implement `cool_segments()` for hot→cold promotion
+12. Write phase2 integration tests
+13. Create `scenarios/tiered_demo.toml`
+
+---
+
+## Verification
+
+```bash
+# Phase 1
+cargo test --workspace
+cargo run -- viz-repl                    # verify metrics command works
+cargo run -- viz-repl --trace-json /tmp/trace.jsonl   # verify trace output
+cargo run -- scenario scenarios/burst.toml             # verify scenario runner
+
+# Phase 2
+cargo test --workspace                   # all existing tests pass
+cargo run -- viz-repl --preset tiered --cold-latency-ms 50
+cargo run -- scenario scenarios/cold_reads.toml --preset base --trace-json /tmp/base.jsonl
+cargo run -- scenario scenarios/cold_reads.toml --preset tiered --trace-json /tmp/tiered.jsonl
+# Compare metrics from both traces to see the before/after tradeoff
+```
