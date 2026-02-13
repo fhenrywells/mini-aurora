@@ -10,6 +10,7 @@ use mini_aurora_common::{
 use mini_aurora_pagestore::page_cache::PageCache;
 use mini_aurora_wal::reader::{ReadResult, WalReader, header_to_record};
 use mini_aurora_wal::recovery::{recover, RecoveryResult};
+use mini_aurora_wal::segment::{LsnLocation, SegmentManager, Tier};
 use mini_aurora_wal::writer::WalWriter;
 
 use super::events::VizEvent;
@@ -20,22 +21,32 @@ use super::renderer::{VizRenderer, data_preview};
 /// Mirrors `StorageEngine` from `crates/storage/src/engine.rs` but interleaves
 /// `VizEvent` emissions so every sub-operation is observable.
 pub struct VizStorageEngine {
-    inner: Mutex<Inner>,
+    inner: Mutex<VizInner>,
     renderer: Arc<Mutex<VizRenderer>>,
 }
 
-struct Inner {
-    wal_path: PathBuf,
-    writer: WalWriter,
+enum VizWalBackend {
+    SingleFile {
+        wal_path: PathBuf,
+        writer: WalWriter,
+        lsn_offsets: HashMap<Lsn, u64>,
+    },
+    Segmented {
+        manager: SegmentManager,
+        lsn_offsets: HashMap<Lsn, LsnLocation>,
+    },
+}
+
+struct VizInner {
+    backend: VizWalBackend,
     page_index: HashMap<PageId, Lsn>,
-    lsn_offsets: HashMap<Lsn, u64>,
     next_lsn: Lsn,
     durability: DurabilityState,
     page_cache: PageCache,
 }
 
 impl VizStorageEngine {
-    /// Open or create a storage engine backed by the WAL at `wal_path`.
+    /// Open or create a storage engine backed by a single WAL file.
     pub fn open(
         wal_path: &Path,
         renderer: Arc<Mutex<VizRenderer>>,
@@ -56,13 +67,43 @@ impl VizStorageEngine {
         let page_cache = PageCache::new(1024);
 
         Ok(Self {
-            inner: Mutex::new(Inner {
-                wal_path: wal_path.to_path_buf(),
-                writer,
+            inner: Mutex::new(VizInner {
+                backend: VizWalBackend::SingleFile {
+                    wal_path: wal_path.to_path_buf(),
+                    writer,
+                    lsn_offsets,
+                },
                 page_index,
-                lsn_offsets,
                 next_lsn,
                 durability,
+                page_cache,
+            }),
+            renderer,
+        })
+    }
+
+    /// Open a storage engine with segmented WAL and hot/cold tiering.
+    pub fn open_tiered(
+        base_dir: &Path,
+        segment_size_bytes: u64,
+        cold_latency: std::time::Duration,
+        renderer: Arc<Mutex<VizRenderer>>,
+    ) -> Result<Self, StorageError> {
+        let mut manager = SegmentManager::open(base_dir, segment_size_bytes, cold_latency)?;
+        let recovery = manager.recover()?;
+
+        let next_lsn = if recovery.durability.vdl == 0 { 1 } else { recovery.durability.vdl + 1 };
+        let page_cache = PageCache::new(1024);
+
+        Ok(Self {
+            inner: Mutex::new(VizInner {
+                backend: VizWalBackend::Segmented {
+                    manager,
+                    lsn_offsets: recovery.lsn_offsets,
+                },
+                page_index: recovery.page_index,
+                next_lsn,
+                durability: recovery.durability,
                 page_cache,
             }),
             renderer,
@@ -82,9 +123,18 @@ impl VizStorageEngine {
         buffer_pool_pages: Vec<PageId>,
     ) {
         let inner = self.inner.lock().unwrap();
-        let wal_file_size = std::fs::metadata(&inner.wal_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+
+        let wal_file_size = match &inner.backend {
+            VizWalBackend::SingleFile { wal_path, .. } => {
+                std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0)
+            }
+            VizWalBackend::Segmented { .. } => 0, // not tracked per-file for segmented
+        };
+
+        let lsn_offset_count = match &inner.backend {
+            VizWalBackend::SingleFile { lsn_offsets, .. } => lsn_offsets.len(),
+            VizWalBackend::Segmented { lsn_offsets, .. } => lsn_offsets.len(),
+        };
 
         let wal_lsn_range = if inner.next_lsn > 1 {
             Some((1, inner.next_lsn - 1))
@@ -101,7 +151,7 @@ impl VizStorageEngine {
             vcl: inner.durability.vcl,
             vdl: inner.durability.vdl,
             page_index: inner.page_index.clone(),
-            lsn_offset_count: inner.lsn_offsets.len(),
+            lsn_offset_count,
             page_cache_count: inner.page_cache.len(),
             wal_file_size,
             wal_lsn_range,
@@ -125,9 +175,6 @@ impl StorageApi for VizStorageEngine {
         }
         let last_lsn = inner.next_lsn - 1;
 
-        // Drop lock briefly to emit (renderer lock must not be held while inner is locked)
-        // Actually, we can emit while holding inner since renderer is a separate lock.
-        // No code path acquires inner while holding renderer, so no deadlock.
         self.renderer.lock().unwrap().render(&VizEvent::AssignLsns { first_lsn, last_lsn });
 
         // Step: Link prev_lsn chains
@@ -140,38 +187,67 @@ impl StorageApi for VizStorageEngine {
             });
         }
 
-        // Step: WAL append
-        let wal_offset = std::fs::metadata(&inner.wal_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let total_bytes: u64 = records
-            .iter()
-            .map(|r| LOG_ENTRY_HEADER_SIZE as u64 + r.data.len() as u64)
-            .sum();
+        // Step: WAL append (backend-specific)
+        match &mut inner.backend {
+            VizWalBackend::SingleFile { wal_path, writer, lsn_offsets } => {
+                let wal_offset = std::fs::metadata(wal_path.as_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let total_bytes: u64 = records.iter()
+                    .map(|r| LOG_ENTRY_HEADER_SIZE as u64 + r.data.len() as u64)
+                    .sum();
 
-        inner.writer.append_batch(&records)?;
+                writer.append_batch(&records)?;
 
-        self.renderer.lock().unwrap().render(&VizEvent::WalAppend {
-            first_lsn,
-            last_lsn,
-            offset: wal_offset,
-            bytes: total_bytes,
-        });
+                self.renderer.lock().unwrap().render(&VizEvent::WalAppend {
+                    first_lsn,
+                    last_lsn,
+                    offset: wal_offset,
+                    bytes: total_bytes,
+                });
 
-        // Step: WAL sync
-        inner.writer.sync()?;
-        self.renderer.lock().unwrap().render(&VizEvent::WalSync);
+                writer.sync()?;
+                self.renderer.lock().unwrap().render(&VizEvent::WalSync);
 
-        // Step: Update in-memory indexes
-        let mut current_offset = wal_offset;
+                let mut current_offset = wal_offset;
+                for record in &records {
+                    lsn_offsets.insert(record.lsn, current_offset);
+                    self.renderer.lock().unwrap().render(&VizEvent::UpdateLsnOffset {
+                        lsn: record.lsn,
+                        file_offset: current_offset,
+                    });
+                    current_offset += LOG_ENTRY_HEADER_SIZE as u64 + record.data.len() as u64;
+                }
+            }
+            VizWalBackend::Segmented { manager, lsn_offsets } => {
+                let total_bytes: u64 = records.iter()
+                    .map(|r| LOG_ENTRY_HEADER_SIZE as u64 + r.data.len() as u64)
+                    .sum();
+
+                let locations = manager.append_batch(&records)?;
+
+                self.renderer.lock().unwrap().render(&VizEvent::WalAppend {
+                    first_lsn,
+                    last_lsn,
+                    offset: 0,
+                    bytes: total_bytes,
+                });
+
+                manager.sync()?;
+                self.renderer.lock().unwrap().render(&VizEvent::WalSync);
+
+                for (record, loc) in records.iter().zip(locations.iter()) {
+                    lsn_offsets.insert(record.lsn, *loc);
+                    self.renderer.lock().unwrap().render(&VizEvent::UpdateLsnOffset {
+                        lsn: record.lsn,
+                        file_offset: loc.file_offset,
+                    });
+                }
+            }
+        }
+
+        // Step: Update page index
         for record in &records {
-            inner.lsn_offsets.insert(record.lsn, current_offset);
-            self.renderer.lock().unwrap().render(&VizEvent::UpdateLsnOffset {
-                lsn: record.lsn,
-                file_offset: current_offset,
-            });
-            current_offset += LOG_ENTRY_HEADER_SIZE as u64 + record.data.len() as u64;
-
             let entry = inner.page_index.entry(record.page_id).or_insert(0);
             if record.lsn > *entry {
                 *entry = record.lsn;
@@ -245,56 +321,15 @@ impl StorageApi for VizStorageEngine {
             });
         }
 
-        // Step: Chain walk (inline for per-step events)
-        let mut chain: Vec<RedoRecord> = Vec::new();
-        let mut current_lsn = latest_lsn;
-        let mut reader = WalReader::open(&inner.wal_path)?;
-
-        while current_lsn != 0 {
-            if current_lsn > read_point {
-                let offset = match inner.lsn_offsets.get(&current_lsn) {
-                    Some(&off) => off,
-                    None => break,
-                };
-                reader.seek_to(offset)?;
-                match reader.read_entry()? {
-                    ReadResult::Entry(hdr, _data) => {
-                        self.renderer.lock().unwrap().render(&VizEvent::ChainWalkStep {
-                            page_id,
-                            lsn: current_lsn,
-                            prev_lsn: hdr.prev_lsn,
-                            skipped: true,
-                        });
-                        current_lsn = hdr.prev_lsn;
-                        continue;
-                    }
-                    _ => break,
-                }
+        // Step: Chain walk (backend-specific)
+        let chain = match &inner.backend {
+            VizWalBackend::SingleFile { wal_path, lsn_offsets, .. } => {
+                self.walk_single_file_chain(page_id, latest_lsn, read_point, wal_path, lsn_offsets)?
             }
-
-            let offset = match inner.lsn_offsets.get(&current_lsn) {
-                Some(&off) => off,
-                None => break,
-            };
-            reader.seek_to(offset)?;
-            match reader.read_entry()? {
-                ReadResult::Entry(hdr, data) => {
-                    self.renderer.lock().unwrap().render(&VizEvent::ChainWalkStep {
-                        page_id,
-                        lsn: hdr.lsn,
-                        prev_lsn: hdr.prev_lsn,
-                        skipped: false,
-                    });
-                    let record = header_to_record(&hdr, data);
-                    let prev = hdr.prev_lsn;
-                    chain.push(record);
-                    current_lsn = prev;
-                }
-                _ => break,
+            VizWalBackend::Segmented { manager, lsn_offsets } => {
+                self.walk_segmented_chain(page_id, latest_lsn, read_point, lsn_offsets, manager)?
             }
-        }
-
-        chain.reverse();
+        };
 
         if chain.is_empty() {
             return Err(StorageError::PageNotFound {
@@ -310,7 +345,7 @@ impl StorageApi for VizStorageEngine {
             lsns,
         });
 
-        // Step: Materialize page (inline for per-record events)
+        // Step: Materialize page
         let mut page = empty_page();
         for record in &chain {
             let start = record.offset as usize;
@@ -344,5 +379,147 @@ impl StorageApi for VizStorageEngine {
     async fn get_durability_state(&self) -> Result<DurabilityState, StorageError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.durability.clone())
+    }
+}
+
+// Private chain-walk helpers
+impl VizStorageEngine {
+    fn walk_single_file_chain(
+        &self,
+        page_id: PageId,
+        latest_lsn: Lsn,
+        read_point: Lsn,
+        wal_path: &Path,
+        lsn_offsets: &HashMap<Lsn, u64>,
+    ) -> Result<Vec<RedoRecord>, StorageError> {
+        let mut chain = Vec::new();
+        let mut current_lsn = latest_lsn;
+        let mut reader = WalReader::open(wal_path)?;
+
+        while current_lsn != 0 {
+            if current_lsn > read_point {
+                let offset = match lsn_offsets.get(&current_lsn) {
+                    Some(&off) => off,
+                    None => break,
+                };
+                reader.seek_to(offset)?;
+                match reader.read_entry()? {
+                    ReadResult::Entry(hdr, _data) => {
+                        self.renderer.lock().unwrap().render(&VizEvent::ChainWalkStep {
+                            page_id,
+                            lsn: current_lsn,
+                            prev_lsn: hdr.prev_lsn,
+                            skipped: true,
+                        });
+                        current_lsn = hdr.prev_lsn;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+
+            let offset = match lsn_offsets.get(&current_lsn) {
+                Some(&off) => off,
+                None => break,
+            };
+            reader.seek_to(offset)?;
+            match reader.read_entry()? {
+                ReadResult::Entry(hdr, data) => {
+                    self.renderer.lock().unwrap().render(&VizEvent::ChainWalkStep {
+                        page_id,
+                        lsn: hdr.lsn,
+                        prev_lsn: hdr.prev_lsn,
+                        skipped: false,
+                    });
+                    let record = header_to_record(&hdr, data);
+                    let prev = hdr.prev_lsn;
+                    chain.push(record);
+                    current_lsn = prev;
+                }
+                _ => break,
+            }
+        }
+
+        chain.reverse();
+        Ok(chain)
+    }
+
+    fn walk_segmented_chain(
+        &self,
+        page_id: PageId,
+        latest_lsn: Lsn,
+        read_point: Lsn,
+        lsn_offsets: &HashMap<Lsn, LsnLocation>,
+        manager: &SegmentManager,
+    ) -> Result<Vec<RedoRecord>, StorageError> {
+        let mut chain = Vec::new();
+        let mut current_lsn = latest_lsn;
+        let mut last_segment_id: Option<u32> = None;
+        let mut reader_cache: Option<(WalReader, Tier)> = None;
+
+        while current_lsn != 0 {
+            if current_lsn > read_point {
+                let loc = match lsn_offsets.get(&current_lsn) {
+                    Some(loc) => loc,
+                    None => break,
+                };
+                let (mut reader, _tier) = manager.open_segment_reader(loc.segment_id)?;
+                reader.seek_to(loc.file_offset)?;
+                match reader.read_entry()? {
+                    ReadResult::Entry(hdr, _data) => {
+                        self.renderer.lock().unwrap().render(&VizEvent::ChainWalkStep {
+                            page_id,
+                            lsn: current_lsn,
+                            prev_lsn: hdr.prev_lsn,
+                            skipped: true,
+                        });
+                        current_lsn = hdr.prev_lsn;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+
+            let loc = match lsn_offsets.get(&current_lsn) {
+                Some(loc) => loc,
+                None => break,
+            };
+
+            let need_new_reader = last_segment_id != Some(loc.segment_id);
+            if need_new_reader {
+                let (reader, tier) = manager.open_segment_reader(loc.segment_id)?;
+                if tier == Tier::Cold {
+                    let latency_ms = manager.cold_latency().as_millis() as u64;
+                    manager.inject_cold_latency();
+                    self.renderer.lock().unwrap().render(&VizEvent::ColdTierRead {
+                        segment_id: loc.segment_id,
+                        latency_ms,
+                    });
+                }
+                reader_cache = Some((reader, tier));
+                last_segment_id = Some(loc.segment_id);
+            }
+
+            let (ref mut reader, _) = reader_cache.as_mut().unwrap();
+            reader.seek_to(loc.file_offset)?;
+            match reader.read_entry()? {
+                ReadResult::Entry(hdr, data) => {
+                    self.renderer.lock().unwrap().render(&VizEvent::ChainWalkStep {
+                        page_id,
+                        lsn: hdr.lsn,
+                        prev_lsn: hdr.prev_lsn,
+                        skipped: false,
+                    });
+                    let record = header_to_record(&hdr, data);
+                    let prev = hdr.prev_lsn;
+                    chain.push(record);
+                    current_lsn = prev;
+                }
+                _ => break,
+            }
+        }
+
+        chain.reverse();
+        Ok(chain)
     }
 }

@@ -17,6 +17,9 @@ use viz::compute::VizComputeEngine;
 use viz::engine::VizStorageEngine;
 use viz::events::VizConfig;
 use viz::renderer::VizRenderer;
+use viz::tracer::JsonTracer;
+
+mod scenario;
 
 // ---------------------------------------------------------------------------
 // Viz REPL types
@@ -106,14 +109,28 @@ async fn main() -> anyhow::Result<()> {
     // Parse optional flags
     let delay_ms = parse_flag_value(&args, "--delay").unwrap_or(300);
     let no_color = args.iter().any(|a| a == "--no-color");
+    let trace_json_path = parse_flag_string(&args, "--trace-json");
+    let preset = parse_flag_string(&args, "--preset").unwrap_or_else(|| "base".to_string());
+    let segment_size = parse_flag_value(&args, "--segment-size").unwrap_or(4096);
+    let cold_latency_ms = parse_flag_value(&args, "--cold-latency-ms").unwrap_or(50);
 
     match cmd {
         "demo" => run_demo().await?,
         "repl" => run_repl().await?,
         "viz-demo" => run_viz_demo(delay_ms, !no_color).await?,
-        "viz-repl" => run_viz_repl(delay_ms, !no_color).await?,
+        "viz-repl" => run_viz_repl(delay_ms, !no_color, trace_json_path, &preset, segment_size, cold_latency_ms).await?,
+        "scenario" => {
+            let scenario_path = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: mini-aurora scenario <file.toml> [--preset base|tiered] [--trace-json path]");
+                std::process::exit(1);
+            });
+            scenario::run_scenario_cli(&scenario_path, &preset, trace_json_path.as_deref(), segment_size, cold_latency_ms).await?;
+        }
         _ => {
-            eprintln!("Usage: mini-aurora [demo|repl|viz-demo|viz-repl] [--delay <ms>] [--no-color]");
+            eprintln!("Usage: mini-aurora [demo|repl|viz-demo|viz-repl|scenario] [--delay <ms>] [--no-color]");
+            eprintln!("       [--preset base|tiered] [--trace-json path]");
+            eprintln!("       [--segment-size <bytes>] [--cold-latency-ms <ms>]");
+            eprintln!("       mini-aurora scenario <file.toml> [flags...]");
             std::process::exit(1);
         }
     }
@@ -126,6 +143,13 @@ fn parse_flag_value(args: &[String], flag: &str) -> Option<u64> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
+}
+
+fn parse_flag_string(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(|v| v.clone())
 }
 
 async fn run_demo() -> anyhow::Result<()> {
@@ -348,10 +372,10 @@ async fn run_viz_demo(delay_ms: u64, color: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
-    println!("=== Mini-Aurora Viz REPL ===");
+async fn run_viz_repl(delay_ms: u64, color: bool, trace_json: Option<String>, preset: &str, segment_size: u64, cold_latency_ms: u64) -> anyhow::Result<()> {
+    println!("=== Mini-Aurora Viz REPL (preset: {preset}) ===");
     println!("Commands: put <page> <offset> <text>, get <page>, refresh");
-    println!("          node A|B, state, bg <node> write|read|mixed <ms>");
+    println!("          node A|B, state, metrics, bg <node> write|read|mixed <ms>");
     println!("          bg stop <node>, bg list, viz on|off, delay <ms>");
     println!("          1/2/3 (run suggestion), quit\n");
 
@@ -360,10 +384,27 @@ async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
         color,
         enabled: true,
     };
-    let renderer = Arc::new(Mutex::new(VizRenderer::new(config)));
+    let mut renderer_inner = VizRenderer::new(config);
+    if let Some(ref path) = trace_json {
+        let tracer = JsonTracer::open(std::path::Path::new(path))?;
+        renderer_inner.set_tracer(tracer);
+        println!("Tracing events to: {path}");
+    }
+    let renderer = Arc::new(Mutex::new(renderer_inner));
 
-    let wal_path = PathBuf::from("/tmp/mini-aurora-viz-repl.wal");
-    let storage = Arc::new(VizStorageEngine::open(&wal_path, renderer.clone())?);
+    let storage: Arc<VizStorageEngine> = match preset {
+        "tiered" => {
+            let base_dir = PathBuf::from("/tmp/mini-aurora-viz-tiered");
+            let _ = std::fs::remove_dir_all(&base_dir);
+            let cold_latency = Duration::from_millis(cold_latency_ms);
+            println!("Tiered storage: segment_size={segment_size}B, cold_latency={cold_latency_ms}ms");
+            Arc::new(VizStorageEngine::open_tiered(&base_dir, segment_size, cold_latency, renderer.clone())?)
+        }
+        _ => {
+            let wal_path = PathBuf::from("/tmp/mini-aurora-viz-repl.wal");
+            Arc::new(VizStorageEngine::open(&wal_path, renderer.clone())?)
+        }
+    };
 
     let node_a = Arc::new(VizComputeEngine::new(
         storage.clone(), 256, renderer.clone(), "A".to_string(),
@@ -556,6 +597,14 @@ async fn run_viz_repl(delay_ms: u64, color: bool) -> anyhow::Result<()> {
                                 );
                             }
                             Err(e) => println!("Error: {e}"),
+                        }
+                        CommandOutcome::None
+                    }
+                    "metrics" => {
+                        let r = state.renderer.lock().unwrap();
+                        match r.metrics_summary() {
+                            Some(summary) => println!("{summary}"),
+                            None => println!("Metrics not available."),
                         }
                         CommandOutcome::None
                     }

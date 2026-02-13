@@ -1,0 +1,99 @@
+[meta]
+name = "Noisy Neighbor"
+description = "Node A does heavy writes while Node B reads with a stale read point"
+
+# Node A writes aggressively
+[[steps]]
+op = "put"
+page_id = 1
+offset = 0
+data = "v1-from-A"
+node = "A"
+
+[[steps]]
+op = "put"
+page_id = 2
+offset = 0
+data = "v1-pg2-A"
+node = "A"
+
+[[steps]]
+op = "put"
+page_id = 3
+offset = 0
+data = "v1-pg3-A"
+node = "A"
+
+# Node B refreshes and reads (should see v1)
+[[steps]]
+op = "refresh"
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 1
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 2
+node = "B"
+
+# Node A overwrites while B still at old read point
+[[steps]]
+op = "put"
+page_id = 1
+offset = 0
+data = "v2-from-A"
+node = "A"
+
+[[steps]]
+op = "put"
+page_id = 2
+offset = 0
+data = "v2-pg2-A"
+node = "A"
+
+# Node B reads again — stale read, sees v1 from buffer pool
+[[steps]]
+op = "get"
+page_id = 1
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 2
+node = "B"
+
+# Node B refreshes to catch up
+[[steps]]
+op = "refresh"
+node = "B"
+
+# Now sees v2
+[[steps]]
+op = "get"
+page_id = 1
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 2
+node = "B"
+
+# More overwrites to churn the WAL
+[[steps]]
+op = "repeat"
+count = 20
+steps = [
+    { op = "put", page_id = 1, offset = 0, data = "churn", node = "A" },
+]
+
+[[steps]]
+op = "refresh"
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 1
+node = "B"

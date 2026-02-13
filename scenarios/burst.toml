@@ -1,0 +1,20 @@
+[meta]
+name = "Burst Write"
+description = "50 rapid writes followed by reads — tests WAL throughput and cache churn"
+
+[[steps]]
+op = "repeat"
+count = 50
+steps = [
+    { op = "put", page_id = 1, offset = 0, data = "burst-write" },
+]
+
+[[steps]]
+op = "refresh"
+
+[[steps]]
+op = "repeat"
+count = 10
+steps = [
+    { op = "get", page_id = 1 },
+]

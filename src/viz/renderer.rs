@@ -5,6 +5,8 @@ use std::thread;
 use mini_aurora_common::{Lsn, PageId};
 
 use super::events::{VizConfig, VizEvent};
+use super::metrics::MetricsCollector;
+use super::tracer::JsonTracer;
 
 const PANEL_HEIGHT: usize = 15;
 const PANEL_INNER: usize = 24;
@@ -84,6 +86,8 @@ pub struct VizRenderer {
     event_log: Vec<String>,
     operation_header: String,
     term_width: usize,
+    metrics: Option<MetricsCollector>,
+    tracer: Option<JsonTracer>,
 }
 
 impl VizRenderer {
@@ -107,11 +111,23 @@ impl VizRenderer {
             event_log: Vec::new(),
             operation_header: String::new(),
             term_width,
+            metrics: Some(MetricsCollector::new()),
+            tracer: None,
         }
     }
 
     pub fn config_mut(&mut self) -> &mut VizConfig {
         &mut self.config
+    }
+
+    /// Set a JSON tracer to record all events.
+    pub fn set_tracer(&mut self, tracer: JsonTracer) {
+        self.tracer = Some(tracer);
+    }
+
+    /// Return the current metrics summary, if metrics are enabled.
+    pub fn metrics_summary(&self) -> Option<super::metrics::MetricsSummary> {
+        self.metrics.as_ref().map(|m| m.summary())
     }
 
     /// Register a compute node so it appears in the panel.
@@ -144,6 +160,14 @@ impl VizRenderer {
 
     /// Render a single event: update state, log it, redraw frame, sleep.
     pub fn render(&mut self, event: &VizEvent) {
+        // Always record metrics and trace, even when viz is disabled.
+        if let Some(ref mut metrics) = self.metrics {
+            metrics.record_event(event);
+        }
+        if let Some(ref mut tracer) = self.tracer {
+            tracer.trace(event);
+        }
+
         if !self.config.enabled {
             return;
         }
@@ -201,6 +225,9 @@ impl VizRenderer {
             VizEvent::MaterializeComplete { .. } => "\u{2193} materialized".to_string(),
             VizEvent::PageCacheInsert { .. } => "\u{2191} cache insert".to_string(),
             VizEvent::BufferPoolInsert { .. } => "\u{2191} page \u{2192} buf".to_string(),
+            VizEvent::SegmentRotation { new_id, .. } => format!("\u{2193} rotate\u{2192}seg{new_id}"),
+            VizEvent::ColdTierRead { segment_id, .. } => format!("\u{2193} cold seg{segment_id}"),
+            VizEvent::SegmentCooled { segment_id } => format!("\u{2193} cool seg{segment_id}"),
             VizEvent::StateSnapshot { .. } => String::new(),
         }
     }
@@ -378,6 +405,15 @@ impl VizRenderer {
             }
             VizEvent::BufferPoolInsert { page_id, read_point } => {
                 format!("BufPool insert pg{page_id} @L{read_point}")
+            }
+            VizEvent::SegmentRotation { sealed_id, new_id, sealed_lsn_range } => {
+                format!("Segment rotate: seal seg{sealed_id} (L{}..L{}), open seg{new_id}", sealed_lsn_range.0, sealed_lsn_range.1)
+            }
+            VizEvent::ColdTierRead { segment_id, latency_ms } => {
+                format!("Cold read seg{segment_id} (+{latency_ms}ms)")
+            }
+            VizEvent::SegmentCooled { segment_id } => {
+                format!("Cooled seg{segment_id} hot->cold")
             }
             VizEvent::StateSnapshot { .. } => String::new(),
         }

@@ -1,0 +1,62 @@
+[meta]
+name = "Tiered Storage Demo"
+description = "Writes enough data to trigger segment rotation, then reads back across hot and cold segments."
+
+# Phase 1: Write enough records to fill a segment and trigger rotation.
+# With default --segment-size 4096, each record is ~30-50 bytes serialized,
+# so ~100 writes should fill ~2 segments.
+[[steps]]
+op = "repeat"
+count = 50
+steps = [
+    { op = "put", page_id = 1, offset = 0, data = "seg-fill-A" },
+    { op = "put", page_id = 2, offset = 0, data = "seg-fill-B" },
+]
+
+# Phase 2: Refresh and read back
+[[steps]]
+op = "refresh"
+
+[[steps]]
+op = "get"
+page_id = 1
+
+[[steps]]
+op = "get"
+page_id = 2
+
+# Phase 3: Write more data on new pages to push segment count higher
+[[steps]]
+op = "repeat"
+count = 20
+steps = [
+    { op = "put", page_id = 3, offset = 0, data = "cold-candidate" },
+]
+
+# Phase 4: Read page 3 — chain may span multiple segments
+[[steps]]
+op = "refresh"
+
+[[steps]]
+op = "get"
+page_id = 3
+
+# Phase 5: Cross-node reads
+[[steps]]
+op = "refresh"
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 1
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 2
+node = "B"
+
+[[steps]]
+op = "get"
+page_id = 3
+node = "B"

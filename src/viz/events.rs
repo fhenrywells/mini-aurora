@@ -4,7 +4,7 @@ use std::time::Duration;
 use mini_aurora_common::{Lsn, PageId};
 
 /// Every discrete internal operation that the visualization can display.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum VizEvent {
     // ── PUT path ──────────────────────────────────────────────────────
 
@@ -69,6 +69,17 @@ pub enum VizEvent {
 
     /// Page inserted into compute buffer pool.
     BufferPoolInsert { page_id: PageId, read_point: Lsn },
+
+    // ── Tiered storage ────────────────────────────────────────────────
+
+    /// A WAL segment was sealed and a new one opened.
+    SegmentRotation { sealed_id: u32, new_id: u32, sealed_lsn_range: (u64, u64) },
+
+    /// A read hit a cold-tier segment, incurring extra latency.
+    ColdTierRead { segment_id: u32, latency_ms: u64 },
+
+    /// A segment was moved from hot to cold tier.
+    SegmentCooled { segment_id: u32 },
 
     // ── State ─────────────────────────────────────────────────────────
 

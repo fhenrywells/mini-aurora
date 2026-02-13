@@ -1,0 +1,127 @@
+[meta]
+name = "Cold Reads"
+description = "Write 100 distinct pages, then read all — tests cache miss rate and materialization"
+
+[[steps]]
+op = "repeat"
+count = 100
+steps = [
+    { op = "put", page_id = 1, offset = 0, data = "cold-data" },
+]
+
+# The repeat above writes to page 1 each time. To write to distinct pages,
+# we use explicit steps for a representative set.
+
+[[steps]]
+op = "put"
+page_id = 2
+offset = 0
+data = "page-two"
+
+[[steps]]
+op = "put"
+page_id = 3
+offset = 0
+data = "page-three"
+
+[[steps]]
+op = "put"
+page_id = 4
+offset = 0
+data = "page-four"
+
+[[steps]]
+op = "put"
+page_id = 5
+offset = 0
+data = "page-five"
+
+[[steps]]
+op = "put"
+page_id = 6
+offset = 0
+data = "page-six"
+
+[[steps]]
+op = "put"
+page_id = 7
+offset = 0
+data = "page-seven"
+
+[[steps]]
+op = "put"
+page_id = 8
+offset = 0
+data = "page-eight"
+
+[[steps]]
+op = "put"
+page_id = 9
+offset = 0
+data = "page-nine"
+
+[[steps]]
+op = "put"
+page_id = 10
+offset = 0
+data = "page-ten"
+
+[[steps]]
+op = "refresh"
+
+# Read all written pages — first reads are cache misses, triggering materialization
+[[steps]]
+op = "repeat"
+count = 10
+steps = [
+    { op = "get", page_id = 1 },
+]
+
+[[steps]]
+op = "get"
+page_id = 2
+
+[[steps]]
+op = "get"
+page_id = 3
+
+[[steps]]
+op = "get"
+page_id = 4
+
+[[steps]]
+op = "get"
+page_id = 5
+
+[[steps]]
+op = "get"
+page_id = 6
+
+[[steps]]
+op = "get"
+page_id = 7
+
+[[steps]]
+op = "get"
+page_id = 8
+
+[[steps]]
+op = "get"
+page_id = 9
+
+[[steps]]
+op = "get"
+page_id = 10
+
+# Read them again — should hit the cache
+[[steps]]
+op = "get"
+page_id = 1
+
+[[steps]]
+op = "get"
+page_id = 2
+
+[[steps]]
+op = "get"
+page_id = 3
