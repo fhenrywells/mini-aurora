@@ -45,34 +45,32 @@ Aurora's key insight is that the write-ahead log (WAL) _is_ the database — pag
 - **Versioned reads** — read a page at any past LSN by truncating the chain
 - **Crash recovery** — scan WAL, compute VCL/VDL, truncate incomplete MTRs, rebuild indexes
 
-## Running
+## Quick Start
+
+Each mode builds on the last, so start at the top and work down.
 
 ```bash
-# Standard demo (scripted write/read/versioning scenario)
+# 1. Scripted demo — writes pages, reads them back, shows versioning
 cargo run -- demo
 
-# Interactive REPL
+# 2. Interactive REPL — try put/get/state yourself
 cargo run -- repl
 
-# Visualization demo — step-by-step walkthrough of every internal operation
+# 3. Visualization demo — the same writes from (1) but with step-by-step
+#    ASCII diagrams showing every internal operation (WAL append, chain
+#    walk, materialization, cache inserts, etc.)
 cargo run -- viz-demo
 
-# Visualization with options
-cargo run -- viz-demo --delay 0          # instant (no pause between steps)
-cargo run -- viz-demo --delay 1000       # 1 second between steps
-cargo run -- viz-demo --no-color         # plain text, no ANSI codes
-
-# Interactive REPL with visualization (multi-node, suggestions, bg workers)
+# 4. Visualization REPL — full interactive mode with two compute nodes,
+#    contextual suggestions, background workers, and metrics
 cargo run -- viz-repl
-cargo run -- viz-repl --delay 300
-cargo run -- viz-repl --no-color
 ```
 
-### Viz REPL
+## Viz REPL
 
 The viz-repl is a full interactive concurrency demo with two compute nodes, contextual suggestions, and background workers.
 
-#### Commands
+### Commands
 
 ```
 put <page> <offset> <text>          Write to a page
@@ -80,6 +78,7 @@ get <page>                          Read a page
 refresh                             Advance read_point to latest VDL
 node A|B                            Switch active compute node
 state                               Show durability watermarks
+metrics                             Print operation counts and latencies
 bg <node> write|read|mixed <ms>     Start background worker
 bg stop <node>                      Stop background worker
 bg list                             Show running workers
@@ -89,9 +88,9 @@ delay <ms>                          Set step delay
 quit                                Exit
 ```
 
-#### Multi-node
+### Multi-node
 
-Two compute nodes (A and B) share a single storage engine. Each has its own buffer pool and read point. This demonstrates Aurora's read isolation — Node B won't see Node A's writes until it refreshes its read point.
+Two compute nodes (A and B) share a single storage engine. Each has its own buffer pool and read point. Node B won't see Node A's writes until it refreshes its read point — this is Aurora's read isolation.
 
 ```
 A> put 1 0 Hello
@@ -101,9 +100,9 @@ B> refresh          # advance read_point to VDL
 B> get 1            # succeeds — sees "Hello"
 ```
 
-#### Suggestions
+### Suggestions
 
-After each command, numbered shortcuts are displayed. Type `1`, `2`, or `3` to run a suggestion:
+After each command, numbered shortcuts are displayed. Type `1`, `2`, or `3` to run one:
 
 ```
 A> put 1 0 Hello
@@ -115,9 +114,9 @@ A> 1
 "Hello"
 ```
 
-#### Background workers
+### Background workers
 
-Spawn concurrent workers to visualize interleaved operations in real time:
+Spawn concurrent workers to visualize interleaved operations:
 
 ```
 A> bg A write 500           # Node A writes a new page every 500ms
@@ -132,14 +131,120 @@ Worker kinds:
 - **read** — GET cycling through pages 1–10
 - **mixed** — alternates `refresh` and `get`, demonstrating read isolation under concurrent writes
 
-### Viz mode
+## Scenarios
 
-The `viz-demo` and `viz-repl` modes render an ASCII system diagram and walk through each internal operation step-by-step:
+The scenario runner executes a TOML file of put/get/refresh/sleep/repeat steps against the two-node engine and prints metrics at the end.
 
-- **PUT path**: MTR creation, LSN assignment, prev_lsn linking, WAL append + fsync, index updates, VCL/VDL advancement, buffer pool invalidation
-- **GET path**: Buffer pool lookup, page cache lookup, page index lookup, chain walk (per-link), materialization (per-record), cache inserts
+```bash
+cargo run -- scenario scenarios/burst.toml
+```
 
-After each operation, a full system state diagram is displayed showing compute state, storage state, and WAL contents.
+### Included scenarios
+
+| File | What it tests |
+|------|---------------|
+| `scenarios/burst.toml` | 50 rapid writes then reads — WAL throughput and cache churn |
+| `scenarios/cold_reads.toml` | Write many distinct pages, read them all — cache miss rate and materialization |
+| `scenarios/noisy_neighbor.toml` | Node A does heavy writes while Node B reads with a stale read point |
+| `scenarios/tiered_demo.toml` | Fills segments to trigger rotation, reads across hot and cold tiers |
+
+Scenarios accept the same `--preset` and `--trace-json` flags as the viz-repl:
+
+```bash
+cargo run -- scenario scenarios/tiered_demo.toml --preset tiered --trace-json /tmp/trace.json
+```
+
+### Writing your own
+
+A scenario file has a `[meta]` section and a list of `[[steps]]`:
+
+```toml
+[meta]
+name = "My scenario"
+description = "What this scenario demonstrates"
+
+[[steps]]
+op = "put"
+page_id = 1
+offset = 0
+data = "hello"
+node = "A"          # optional, defaults to "A"
+
+[[steps]]
+op = "get"
+page_id = 1
+node = "B"
+
+[[steps]]
+op = "refresh"
+node = "B"
+
+[[steps]]
+op = "sleep_ms"
+value = 100
+
+[[steps]]
+op = "repeat"
+count = 10
+steps = [
+    { op = "put", page_id = 1, offset = 0, data = "loop" },
+]
+```
+
+## Metrics & Tracing
+
+### In-session metrics
+
+Type `metrics` in the viz-repl (or run a scenario — metrics print automatically at the end) to see operation counts and latencies.
+
+### JSON tracing
+
+Pass `--trace-json <path>` to write every internal event (WAL append, chain walk, cache hit/miss, materialization, VCL/VDL advance) as newline-delimited JSON:
+
+```bash
+cargo run -- viz-repl --trace-json /tmp/trace.json
+# or
+cargo run -- scenario scenarios/burst.toml --trace-json /tmp/trace.json
+```
+
+Each line is a JSON object with a `kind`, timestamp, and event-specific fields — useful for post-hoc analysis with `jq`, pandas, or any JSON tooling.
+
+## Storage Variants
+
+### Base (default)
+
+Single-file WAL. This is what runs when you don't pass `--preset`:
+
+```bash
+cargo run -- viz-repl                     # equivalent to --preset base
+```
+
+### Tiered
+
+Segmented WAL with hot/cold tier simulation. Segments rotate at a configurable size; older segments are marked cold and reads from them incur artificial latency to mimic real tiered-storage behavior.
+
+```bash
+cargo run -- viz-repl --preset tiered
+```
+
+Tuning flags (tiered preset only):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--segment-size <bytes>` | 4096 | Max bytes per WAL segment before rotation |
+| `--cold-latency-ms <ms>` | 50 | Artificial read latency for cold segments |
+
+Example with small segments and high cold latency:
+
+```bash
+cargo run -- viz-repl --preset tiered --segment-size 1024 --cold-latency-ms 200
+```
+
+Run the included tiered scenario to see segment rotation in action:
+
+```bash
+cargo run -- scenario scenarios/tiered_demo.toml --preset tiered --trace-json /tmp/tiered.json
+```
 
 ## Tests
 
@@ -147,4 +252,15 @@ After each operation, a full system state diagram is displayed showing compute s
 cargo test --workspace
 ```
 
-50 tests covering WAL read/write, crash recovery, page materialization, cache behavior, compute transactions, storage engine integration, versioned reads, and multi-page atomicity.
+63 tests covering WAL read/write, crash recovery, segmented WAL, page materialization, cache behavior, compute transactions, storage engine integration, versioned reads, and multi-page atomicity.
+
+## Global Flags
+
+| Flag | Applies to | Default | Description |
+|------|-----------|---------|-------------|
+| `--delay <ms>` | `viz-demo`, `viz-repl` | 300 | Pause between visualization steps |
+| `--no-color` | `viz-demo`, `viz-repl` | off | Disable ANSI color codes |
+| `--trace-json <path>` | `viz-repl`, `scenario` | — | Write events as newline-delimited JSON |
+| `--preset base\|tiered` | `viz-repl`, `scenario` | `base` | Storage engine variant |
+| `--segment-size <bytes>` | `viz-repl`, `scenario` (tiered) | 4096 | WAL segment size before rotation |
+| `--cold-latency-ms <ms>` | `viz-repl`, `scenario` (tiered) | 50 | Artificial latency for cold segment reads |
