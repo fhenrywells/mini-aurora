@@ -53,22 +53,46 @@ impl Ansi {
         Self { color }
     }
     fn green(&self, s: &str) -> String {
-        if self.color { format!("\x1b[32m{s}\x1b[0m") } else { s.to_string() }
+        if self.color {
+            format!("\x1b[32m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
     }
     fn yellow(&self, s: &str) -> String {
-        if self.color { format!("\x1b[33m{s}\x1b[0m") } else { s.to_string() }
+        if self.color {
+            format!("\x1b[33m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
     }
     fn cyan(&self, s: &str) -> String {
-        if self.color { format!("\x1b[36m{s}\x1b[0m") } else { s.to_string() }
+        if self.color {
+            format!("\x1b[36m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
     }
     fn bold(&self, s: &str) -> String {
-        if self.color { format!("\x1b[1m{s}\x1b[0m") } else { s.to_string() }
+        if self.color {
+            format!("\x1b[1m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
     }
     fn dim(&self, s: &str) -> String {
-        if self.color { format!("\x1b[2m{s}\x1b[0m") } else { s.to_string() }
+        if self.color {
+            format!("\x1b[2m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
     }
     fn bold_green(&self, s: &str) -> String {
-        if self.color { format!("\x1b[1;32m{s}\x1b[0m") } else { s.to_string() }
+        if self.color {
+            format!("\x1b[1;32m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
     }
 }
 
@@ -207,10 +231,18 @@ impl VizRenderer {
             VizEvent::UpdateReadPoint { new, .. } => format!("\u{00b7} rp\u{2192}{new}"),
             VizEvent::BufferPoolInvalidate { page_id } => format!("\u{00b7} evict pg{page_id}"),
             VizEvent::BufferPoolLookup { hit, .. } => {
-                if *hit { "\u{00b7} buf: HIT".to_string() } else { "\u{00b7} buf: MISS".to_string() }
+                if *hit {
+                    "\u{00b7} buf: HIT".to_string()
+                } else {
+                    "\u{00b7} buf: MISS".to_string()
+                }
             }
             VizEvent::PageCacheLookup { hit, .. } => {
-                if *hit { "\u{2193} cache: HIT".to_string() } else { "\u{2193} cache: MISS".to_string() }
+                if *hit {
+                    "\u{2193} cache: HIT".to_string()
+                } else {
+                    "\u{2193} cache: MISS".to_string()
+                }
             }
             VizEvent::PageIndexLookup { .. } => "\u{2193} idx lookup".to_string(),
             VizEvent::ChainWalkStep { lsn, skipped, .. } => {
@@ -225,7 +257,9 @@ impl VizRenderer {
             VizEvent::MaterializeComplete { .. } => "\u{2193} materialized".to_string(),
             VizEvent::PageCacheInsert { .. } => "\u{2191} cache insert".to_string(),
             VizEvent::BufferPoolInsert { .. } => "\u{2191} page \u{2192} buf".to_string(),
-            VizEvent::SegmentRotation { new_id, .. } => format!("\u{2193} rotate\u{2192}seg{new_id}"),
+            VizEvent::SegmentRotation { new_id, .. } => {
+                format!("\u{2193} rotate\u{2192}seg{new_id}")
+            }
             VizEvent::ColdTierRead { segment_id, .. } => format!("\u{2193} cold seg{segment_id}"),
             VizEvent::SegmentCooled { segment_id } => format!("\u{2193} cool seg{segment_id}"),
             VizEvent::StateSnapshot { .. } => String::new(),
@@ -268,14 +302,22 @@ impl VizRenderer {
             VizEvent::AssignLsns { last_lsn, .. } => {
                 self.shared.next_lsn = last_lsn + 1;
             }
-            VizEvent::WalAppend { offset, bytes, first_lsn, last_lsn } => {
+            VizEvent::WalAppend {
+                offset,
+                bytes,
+                first_lsn,
+                last_lsn,
+            } => {
                 self.shared.wal_file_size = offset + bytes;
                 self.shared.wal_lsn_range = Some(match self.shared.wal_lsn_range {
                     Some((first, _)) => (first, *last_lsn),
                     None => (*first_lsn, *last_lsn),
                 });
             }
-            VizEvent::UpdatePageIndex { page_id, latest_lsn } => {
+            VizEvent::UpdatePageIndex {
+                page_id,
+                latest_lsn,
+            } => {
                 self.shared.page_index.insert(*page_id, *latest_lsn);
             }
             VizEvent::UpdateLsnOffset { .. } => {
@@ -329,24 +371,39 @@ impl VizRenderer {
     /// Convert an event to a compact one-liner (plain text, no ANSI).
     fn format_one_liner(event: &VizEvent) -> String {
         match event {
-            VizEvent::MtrCreated { mtr_id, num_records } => {
+            VizEvent::MtrCreated {
+                mtr_id,
+                num_records,
+            } => {
                 format!("MTR #{mtr_id} ({num_records} record)")
             }
-            VizEvent::AssignLsns { first_lsn, last_lsn } => {
+            VizEvent::AssignLsns {
+                first_lsn,
+                last_lsn,
+            } => {
                 if first_lsn == last_lsn {
                     format!("Assign LSN {first_lsn}")
                 } else {
                     format!("Assign LSNs {first_lsn}..{last_lsn}")
                 }
             }
-            VizEvent::LinkPrevLsn { lsn, page_id, prev_lsn } => {
+            VizEvent::LinkPrevLsn {
+                lsn,
+                page_id,
+                prev_lsn,
+            } => {
                 if *prev_lsn == 0 {
                     format!("Link L{lsn}(pg{page_id}) prev=none")
                 } else {
                     format!("Link L{lsn}(pg{page_id}) prev=L{prev_lsn}")
                 }
             }
-            VizEvent::WalAppend { first_lsn, last_lsn, offset, bytes } => {
+            VizEvent::WalAppend {
+                first_lsn,
+                last_lsn,
+                offset,
+                bytes,
+            } => {
                 if first_lsn == last_lsn {
                     format!("WAL append L{first_lsn} @{offset} ({bytes}B)")
                 } else {
@@ -354,7 +411,10 @@ impl VizRenderer {
                 }
             }
             VizEvent::WalSync => "WAL sync (fsync)".to_string(),
-            VizEvent::UpdatePageIndex { page_id, latest_lsn } => {
+            VizEvent::UpdatePageIndex {
+                page_id,
+                latest_lsn,
+            } => {
                 format!("Page index pg{page_id}->L{latest_lsn}")
             }
             VizEvent::UpdateLsnOffset { lsn, file_offset } => {
@@ -368,15 +428,26 @@ impl VizRenderer {
             VizEvent::BufferPoolInvalidate { page_id } => {
                 format!("Evict pg{page_id} from buffer")
             }
-            VizEvent::BufferPoolLookup { page_id, read_point, hit } => {
+            VizEvent::BufferPoolLookup {
+                page_id,
+                read_point,
+                hit,
+            } => {
                 let tag = if *hit { "HIT" } else { "MISS" };
                 format!("BufPool pg{page_id} @L{read_point}: {tag}")
             }
-            VizEvent::PageCacheLookup { page_id, read_point, hit } => {
+            VizEvent::PageCacheLookup {
+                page_id,
+                read_point,
+                hit,
+            } => {
                 let tag = if *hit { "HIT" } else { "MISS" };
                 format!("PageCache pg{page_id} @L{read_point}: {tag}")
             }
-            VizEvent::PageIndexLookup { page_id, latest_lsn } => match latest_lsn {
+            VizEvent::PageIndexLookup {
+                page_id,
+                latest_lsn,
+            } => match latest_lsn {
                 Some(lsn) => format!("PageIdx pg{page_id}->L{lsn}"),
                 None => format!("PageIdx pg{page_id}: not found"),
             },
@@ -387,29 +458,57 @@ impl VizRenderer {
                     format!("Chain: collect L{lsn}")
                 }
             }
-            VizEvent::ChainCollected { page_id, chain_len, lsns } => {
+            VizEvent::ChainCollected {
+                page_id,
+                chain_len,
+                lsns,
+            } => {
                 let chain_str: Vec<String> = lsns.iter().map(|l| format!("L{l}")).collect();
                 format!(
                     "Chain pg{page_id}: {chain_len} rec [{}]",
                     chain_str.join("->")
                 )
             }
-            VizEvent::MaterializeApply { lsn, offset, data_len, .. } => {
+            VizEvent::MaterializeApply {
+                lsn,
+                offset,
+                data_len,
+                ..
+            } => {
                 format!("Apply L{lsn} {data_len}B @{offset}")
             }
-            VizEvent::MaterializeComplete { page_id, read_point } => {
+            VizEvent::MaterializeComplete {
+                page_id,
+                read_point,
+            } => {
                 format!("Materialized pg{page_id} @L{read_point}")
             }
-            VizEvent::PageCacheInsert { page_id, read_point } => {
+            VizEvent::PageCacheInsert {
+                page_id,
+                read_point,
+            } => {
                 format!("Cache pg{page_id} @L{read_point}")
             }
-            VizEvent::BufferPoolInsert { page_id, read_point } => {
+            VizEvent::BufferPoolInsert {
+                page_id,
+                read_point,
+            } => {
                 format!("BufPool insert pg{page_id} @L{read_point}")
             }
-            VizEvent::SegmentRotation { sealed_id, new_id, sealed_lsn_range } => {
-                format!("Segment rotate: seal seg{sealed_id} (L{}..L{}), open seg{new_id}", sealed_lsn_range.0, sealed_lsn_range.1)
+            VizEvent::SegmentRotation {
+                sealed_id,
+                new_id,
+                sealed_lsn_range,
+            } => {
+                format!(
+                    "Segment rotate: seal seg{sealed_id} (L{}..L{}), open seg{new_id}",
+                    sealed_lsn_range.0, sealed_lsn_range.1
+                )
             }
-            VizEvent::ColdTierRead { segment_id, latency_ms } => {
+            VizEvent::ColdTierRead {
+                segment_id,
+                latency_ms,
+            } => {
                 format!("Cold read seg{segment_id} (+{latency_ms}ms)")
             }
             VizEvent::SegmentCooled { segment_id } => {
@@ -465,7 +564,10 @@ impl VizRenderer {
             if bp.is_empty() {
                 "(empty)".to_string()
             } else {
-                bp.iter().map(|p| format!("pg{p}")).collect::<Vec<_>>().join(",")
+                bp.iter()
+                    .map(|p| format!("pg{p}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
             }
         };
 
@@ -476,7 +578,11 @@ impl VizRenderer {
         let pi_str = if pi_entries.is_empty() {
             "(empty)".to_string()
         } else {
-            pi_entries.iter().map(|(p, l)| format!("{p}\u{2192}L{l}")).collect::<Vec<_>>().join(" ")
+            pi_entries
+                .iter()
+                .map(|(p, l)| format!("{p}\u{2192}L{l}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         };
 
         // WAL display
@@ -562,8 +668,8 @@ impl VizRenderer {
         let header_a = format!("Node {} @L{}", label_a, node_a.read_point);
         lines.push(section_top(&header_a)); // row 0
         let (state_a, int_a) = build_node_lines(0);
-        lines.push(state_a);  // row 1
-        lines.push(int_a);    // row 2
+        lines.push(state_a); // row 1
+        lines.push(int_a); // row 2
 
         // --- Node B (row 3-5) ---
         if node_labels.len() > 1 {
@@ -571,8 +677,8 @@ impl VizRenderer {
             let header_b = format!("Node {} @L{}", label_b, node_b.read_point);
             lines.push(section_sep(&header_b)); // row 3
             let (state_b, int_b) = build_node_lines(1);
-            lines.push(state_b);  // row 4
-            lines.push(int_b);    // row 5
+            lines.push(state_b); // row 4
+            lines.push(int_b); // row 5
         } else {
             // Single-node mode: fill with blanks
             lines.push(section_sep("(single node)"));
@@ -639,7 +745,10 @@ impl VizRenderer {
             a.cyan("\u{2502}")
         ));
         // Row 14: bottom border
-        lines.push(a.cyan(&format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(panel_w - 2))));
+        lines.push(a.cyan(&format!(
+            "\u{2514}{}\u{2518}",
+            "\u{2500}".repeat(panel_w - 2)
+        )));
 
         lines
     }
@@ -725,7 +834,11 @@ impl VizRenderer {
 
 /// Helper: format a data preview (first N bytes as string or hex).
 pub fn data_preview(data: &[u8], max_len: usize) -> String {
-    let slice = if data.len() > max_len { &data[..max_len] } else { data };
+    let slice = if data.len() > max_len {
+        &data[..max_len]
+    } else {
+        data
+    };
     match std::str::from_utf8(slice) {
         Ok(s) => {
             if data.len() > max_len {

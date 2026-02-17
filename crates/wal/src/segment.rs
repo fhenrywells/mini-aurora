@@ -50,6 +50,13 @@ impl Manifest {
     }
 }
 
+/// Information about a segment rotation event.
+pub struct RotationInfo {
+    pub sealed_id: SegmentId,
+    pub new_id: SegmentId,
+    pub sealed_lsn_range: (Lsn, Lsn),
+}
+
 /// Manages multiple WAL segment files with hot/cold tiering.
 pub struct SegmentManager {
     hot_dir: PathBuf,
@@ -58,6 +65,7 @@ pub struct SegmentManager {
     active_writer: WalWriter,
     active_segment_id: SegmentId,
     active_first_lsn: Option<Lsn>,
+    active_last_lsn: Option<Lsn>,
     active_bytes_written: u64,
     max_segment_bytes: u64,
     cold_latency: Duration,
@@ -66,7 +74,11 @@ pub struct SegmentManager {
 
 impl SegmentManager {
     /// Open or create a segmented WAL in `base_dir`.
-    pub fn open(base_dir: &Path, max_segment_bytes: u64, cold_latency: Duration) -> Result<Self, std::io::Error> {
+    pub fn open(
+        base_dir: &Path,
+        max_segment_bytes: u64,
+        cold_latency: Duration,
+    ) -> Result<Self, std::io::Error> {
         let hot_dir = base_dir.join("hot");
         let cold_dir = base_dir.join("cold");
         fs::create_dir_all(&hot_dir)?;
@@ -75,7 +87,8 @@ impl SegmentManager {
         let manifest_path = base_dir.join("manifest.json");
         let manifest: Manifest = if manifest_path.exists() {
             let content = fs::read_to_string(&manifest_path)?;
-            serde_json::from_str(&content).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            serde_json::from_str(&content)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
         } else {
             Manifest::new()
         };
@@ -94,6 +107,7 @@ impl SegmentManager {
             active_writer,
             active_segment_id,
             active_first_lsn: None,
+            active_last_lsn: None,
             active_bytes_written,
             max_segment_bytes,
             cold_latency,
@@ -102,15 +116,30 @@ impl SegmentManager {
     }
 
     /// Append a batch of records, rotating segments as needed.
-    /// Returns LsnLocations for each record.
-    pub fn append_batch(&mut self, records: &[RedoRecord]) -> Result<Vec<LsnLocation>, std::io::Error> {
+    /// Returns LsnLocations for each record and info about any rotations that occurred.
+    pub fn append_batch(
+        &mut self,
+        records: &[RedoRecord],
+    ) -> Result<(Vec<LsnLocation>, Vec<RotationInfo>), std::io::Error> {
         let mut locations = Vec::with_capacity(records.len());
+        let mut rotations = Vec::new();
 
         for record in records {
             // Check if we need to rotate before writing
             let entry_size = LOG_ENTRY_HEADER_SIZE as u64 + record.data.len() as u64;
-            if self.active_bytes_written > 0 && self.active_bytes_written + entry_size > self.max_segment_bytes {
+            if self.active_bytes_written > 0
+                && self.active_bytes_written + entry_size > self.max_segment_bytes
+            {
+                let sealed_id = self.active_segment_id;
+                let sealed_first = self.active_first_lsn.unwrap_or(0);
+                let sealed_last = self.active_last_lsn.unwrap_or(sealed_first);
                 self.rotate()?;
+                self.update_sealed_lsn_range(sealed_id, (sealed_first, sealed_last));
+                rotations.push(RotationInfo {
+                    sealed_id,
+                    new_id: self.active_segment_id,
+                    sealed_lsn_range: (sealed_first, sealed_last),
+                });
             }
 
             let file_offset = self.active_bytes_written;
@@ -118,6 +147,7 @@ impl SegmentManager {
             if self.active_first_lsn.is_none() {
                 self.active_first_lsn = Some(record.lsn);
             }
+            self.active_last_lsn = Some(record.lsn);
 
             locations.push(LsnLocation {
                 segment_id: self.active_segment_id,
@@ -128,7 +158,7 @@ impl SegmentManager {
             self.active_bytes_written += entry_size;
         }
 
-        Ok(locations)
+        Ok((locations, rotations))
     }
 
     /// Fsync the active segment.
@@ -167,6 +197,7 @@ impl SegmentManager {
 
         self.active_segment_id = new_id;
         self.active_first_lsn = None;
+        self.active_last_lsn = None;
         self.active_bytes_written = 0;
 
         Ok((sealed_id, new_id))
@@ -182,7 +213,10 @@ impl SegmentManager {
     }
 
     /// Open a reader for a given segment. Returns the reader and its tier.
-    pub fn open_segment_reader(&self, segment_id: SegmentId) -> Result<(WalReader, Tier), std::io::Error> {
+    pub fn open_segment_reader(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<(WalReader, Tier), std::io::Error> {
         // Check if it's the active segment
         if segment_id == self.active_segment_id {
             let path = self.hot_dir.join(segment_filename(segment_id));
@@ -212,7 +246,10 @@ impl SegmentManager {
     /// Keeps the most recent `keep_hot` sealed segments in hot tier.
     pub fn cool_segments(&mut self, keep_hot: usize) -> Result<Vec<SegmentId>, std::io::Error> {
         let mut cooled = Vec::new();
-        let sealed_hot: Vec<usize> = self.manifest.segments.iter()
+        let sealed_hot: Vec<usize> = self
+            .manifest
+            .segments
+            .iter()
             .enumerate()
             .filter(|(_, s)| s.sealed && s.tier == Tier::Hot)
             .map(|(i, _)| i)
@@ -260,13 +297,18 @@ impl SegmentManager {
         let mut cpls = std::collections::BTreeSet::new();
 
         // Collect sealed segment info first to avoid borrow conflict
-        let sealed_info: Vec<(PathBuf, SegmentId)> = self.manifest.segments.iter().map(|seg| {
-            let path = match seg.tier {
-                Tier::Hot => self.hot_dir.join(&seg.filename),
-                Tier::Cold => self.cold_dir.join(&seg.filename),
-            };
-            (path, seg.id)
-        }).collect();
+        let sealed_info: Vec<(PathBuf, SegmentId)> = self
+            .manifest
+            .segments
+            .iter()
+            .map(|seg| {
+                let path = match seg.tier {
+                    Tier::Hot => self.hot_dir.join(&seg.filename),
+                    Tier::Cold => self.cold_dir.join(&seg.filename),
+                };
+                (path, seg.id)
+            })
+            .collect();
 
         // Scan sealed segments in order
         for (path, seg_id) in &sealed_info {
@@ -274,20 +316,39 @@ impl SegmentManager {
                 continue;
             }
             let mut reader = WalReader::open(path)?;
-            self.scan_segment(&mut reader, *seg_id, &mut all_lsns, &mut cpls, &mut lsn_offsets, &mut page_index)?;
+            self.scan_segment(
+                &mut reader,
+                *seg_id,
+                &mut all_lsns,
+                &mut cpls,
+                &mut lsn_offsets,
+                &mut page_index,
+            )?;
         }
 
         // Scan active segment
         let active_path = self.hot_dir.join(segment_filename(self.active_segment_id));
         if active_path.exists() {
             let mut reader = WalReader::open(&active_path)?;
-            self.scan_segment(&mut reader, self.active_segment_id, &mut all_lsns, &mut cpls, &mut lsn_offsets, &mut page_index)?;
+            self.scan_segment(
+                &mut reader,
+                self.active_segment_id,
+                &mut all_lsns,
+                &mut cpls,
+                &mut lsn_offsets,
+                &mut page_index,
+            )?;
             self.active_bytes_written = fs::metadata(&active_path).map(|m| m.len()).unwrap_or(0);
         }
 
         // Compute VCL and VDL
         let vcl = compute_vcl(&all_lsns);
-        let vdl = cpls.iter().rev().find(|&&lsn| lsn <= vcl).copied().unwrap_or(0);
+        let vdl = cpls
+            .iter()
+            .rev()
+            .find(|&&lsn| lsn <= vcl)
+            .copied()
+            .unwrap_or(0);
 
         Ok(RecoveryData {
             durability: DurabilityState { vcl, vdl },
@@ -313,10 +374,13 @@ impl SegmentManager {
                     if hdr.is_mtr_end() {
                         cpls.insert(hdr.lsn);
                     }
-                    lsn_offsets.insert(hdr.lsn, LsnLocation {
-                        segment_id,
-                        file_offset,
-                    });
+                    lsn_offsets.insert(
+                        hdr.lsn,
+                        LsnLocation {
+                            segment_id,
+                            file_offset,
+                        },
+                    );
                     let entry = page_index.entry(hdr.page_id).or_insert(0);
                     if hdr.lsn > *entry {
                         *entry = hdr.lsn;
@@ -386,12 +450,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut mgr = SegmentManager::open(dir.path(), 4096, Duration::ZERO).unwrap();
 
-        let records = vec![
-            make_record(1, 1, 0, false),
-            make_record(2, 2, 0, true),
-        ];
+        let records = vec![make_record(1, 1, 0, false), make_record(2, 2, 0, true)];
 
-        let locs = mgr.append_batch(&records).unwrap();
+        let (locs, _) = mgr.append_batch(&records).unwrap();
         mgr.sync().unwrap();
 
         assert_eq!(locs.len(), 2);
@@ -408,9 +469,9 @@ mod tests {
         let r2 = make_record(2, 2, 0, true);
         let r3 = make_record(3, 1, 1, true);
 
-        let loc1 = mgr.append_batch(&[r1]).unwrap();
-        let loc2 = mgr.append_batch(&[r2]).unwrap();
-        let loc3 = mgr.append_batch(&[r3]).unwrap();
+        let (loc1, _) = mgr.append_batch(&[r1]).unwrap();
+        let (loc2, _) = mgr.append_batch(&[r2]).unwrap();
+        let (loc3, _) = mgr.append_batch(&[r3]).unwrap();
         mgr.sync().unwrap();
 
         // r1: active_bytes=0 → no rotation, writes to segment 1, active_bytes=51
@@ -426,12 +487,12 @@ mod tests {
 
         {
             let mut mgr = SegmentManager::open(dir.path(), 100, Duration::ZERO).unwrap();
-            let records: Vec<RedoRecord> = (1..=5).map(|i| {
-                make_record(i, (i % 3) + 1, if i > 1 { i - 1 } else { 0 }, i == 5)
-            }).collect();
+            let records: Vec<RedoRecord> = (1..=5)
+                .map(|i| make_record(i, (i % 3) + 1, if i > 1 { i - 1 } else { 0 }, i == 5))
+                .collect();
 
             for r in &records {
-                mgr.append_batch(&[r.clone()]).unwrap();
+                mgr.append_batch(&[r.clone()]).unwrap(); // returns (locs, rotations)
             }
             mgr.sync().unwrap();
         }
@@ -453,7 +514,7 @@ mod tests {
 
         for i in 1..=10u64 {
             let r = make_record(i, 1, if i > 1 { i - 1 } else { 0 }, true);
-            mgr.append_batch(&[r]).unwrap();
+            mgr.append_batch(&[r]).unwrap(); // returns (locs, rotations)
         }
         mgr.sync().unwrap();
 
@@ -462,7 +523,8 @@ mod tests {
             let cooled = mgr.cool_segments(1).unwrap();
             assert!(!cooled.is_empty());
 
-            let cold_files: Vec<_> = fs::read_dir(&mgr.cold_dir).unwrap()
+            let cold_files: Vec<_> = fs::read_dir(&mgr.cold_dir)
+                .unwrap()
                 .filter_map(|e| e.ok())
                 .collect();
             assert!(!cold_files.is_empty());
@@ -474,11 +536,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut mgr = SegmentManager::open(dir.path(), 4096, Duration::ZERO).unwrap();
 
-        let records = vec![
-            make_record(1, 1, 0, true),
-            make_record(2, 2, 0, true),
-        ];
-        let locs = mgr.append_batch(&records).unwrap();
+        let records = vec![make_record(1, 1, 0, true), make_record(2, 2, 0, true)];
+        let (locs, _) = mgr.append_batch(&records).unwrap();
         mgr.sync().unwrap();
 
         // Read back from the active segment

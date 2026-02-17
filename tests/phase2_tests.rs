@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mini_aurora_common::{StorageApi, PAGE_SIZE};
+use mini_aurora_compute::engine::ComputeEngine;
 use mini_aurora_storage::config::{StoragePreset, TieredConfig};
 use mini_aurora_storage::engine::StorageEngine;
-use mini_aurora_compute::engine::ComputeEngine;
 use tempfile::TempDir;
 
 fn setup_tiered(segment_size: u64) -> (TempDir, Arc<StorageEngine>) {
@@ -46,7 +46,10 @@ async fn test_tiered_segment_rotation_via_compute() {
 
     // Write enough data to fill multiple segments
     for i in 0u64..30 {
-        compute.put(i % 5 + 1, 0, format!("data-{i}").into_bytes()).await.unwrap();
+        compute
+            .put(i % 5 + 1, 0, format!("data-{i}").into_bytes())
+            .await
+            .unwrap();
     }
 
     // Verify all pages readable
@@ -58,8 +61,16 @@ async fn test_tiered_segment_rotation_via_compute() {
 
     // Verify durability state
     let state = storage.get_durability_state().await.unwrap();
-    assert!(state.vcl >= 30, "VCL should be at least 30, got {}", state.vcl);
-    assert!(state.vdl >= 30, "VDL should be at least 30, got {}", state.vdl);
+    assert!(
+        state.vcl >= 30,
+        "VCL should be at least 30, got {}",
+        state.vcl
+    );
+    assert!(
+        state.vdl >= 30,
+        "VDL should be at least 30, got {}",
+        state.vdl
+    );
 }
 
 // =========================================================================
@@ -70,11 +81,14 @@ async fn test_tiered_atomic_multi_page() {
     let (_dir, storage) = setup_tiered(2048);
     let compute = make_compute(storage);
 
-    compute.put_multi(vec![
-        (10, 0, b"Page Ten".to_vec()),
-        (11, 0, b"Page Eleven".to_vec()),
-        (12, 0, b"Page Twelve".to_vec()),
-    ]).await.unwrap();
+    compute
+        .put_multi(vec![
+            (10, 0, b"Page Ten".to_vec()),
+            (11, 0, b"Page Eleven".to_vec()),
+            (12, 0, b"Page Twelve".to_vec()),
+        ])
+        .await
+        .unwrap();
 
     let p10 = compute.get(10).await.unwrap();
     let p11 = compute.get(11).await.unwrap();
@@ -94,7 +108,10 @@ async fn test_tiered_overwrite_across_segments() {
     let compute = make_compute(storage);
 
     for i in 0..20 {
-        compute.put(1, 0, format!("version-{i:03}").into_bytes()).await.unwrap();
+        compute
+            .put(1, 0, format!("version-{i:03}").into_bytes())
+            .await
+            .unwrap();
     }
 
     let page = compute.get(1).await.unwrap();

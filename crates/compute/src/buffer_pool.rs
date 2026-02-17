@@ -41,11 +41,7 @@ impl BufferPool {
     pub fn insert(&mut self, page_id: PageId, read_point: Lsn, page: Page) {
         // Simple eviction: if at capacity, remove the least accessed entry
         if self.pages.len() >= self.capacity && !self.pages.contains_key(&page_id) {
-            if let Some((&evict_id, _)) = self
-                .pages
-                .iter()
-                .min_by_key(|(_, v)| v.access_count)
-            {
+            if let Some((&evict_id, _)) = self.pages.iter().min_by_key(|(_, v)| v.access_count) {
                 self.pages.remove(&evict_id);
             }
         }

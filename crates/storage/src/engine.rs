@@ -154,7 +154,11 @@ impl StorageApi for StorageEngine {
 
         // Write to WAL (backend-specific)
         match &mut inner.backend {
-            WalBackend::SingleFile { wal_path, writer, lsn_offsets } => {
+            WalBackend::SingleFile {
+                wal_path,
+                writer,
+                lsn_offsets,
+            } => {
                 let mut current_offset = {
                     let metadata = std::fs::metadata(wal_path.as_path())?;
                     metadata.len()
@@ -165,12 +169,15 @@ impl StorageApi for StorageEngine {
 
                 for record in &records {
                     lsn_offsets.insert(record.lsn, current_offset);
-                    current_offset += mini_aurora_common::LOG_ENTRY_HEADER_SIZE as u64
-                        + record.data.len() as u64;
+                    current_offset +=
+                        mini_aurora_common::LOG_ENTRY_HEADER_SIZE as u64 + record.data.len() as u64;
                 }
             }
-            WalBackend::Segmented { manager, lsn_offsets } => {
-                let locations = manager.append_batch(&records)?;
+            WalBackend::Segmented {
+                manager,
+                lsn_offsets,
+            } => {
+                let (locations, _rotations) = manager.append_batch(&records)?;
                 manager.sync()?;
 
                 for (record, loc) in records.iter().zip(locations.iter()) {
@@ -188,7 +195,10 @@ impl StorageApi for StorageEngine {
         }
 
         // Update durability watermarks
-        let highest_lsn = records.last().map(|r| r.lsn).unwrap_or(inner.durability.vcl);
+        let highest_lsn = records
+            .last()
+            .map(|r| r.lsn)
+            .unwrap_or(inner.durability.vcl);
         inner.durability.vcl = highest_lsn;
 
         if let Some(cpl) = records.iter().rev().find(|r| r.is_mtr_end) {
@@ -227,13 +237,18 @@ impl StorageApi for StorageEngine {
 
         // Collect the redo chain and materialize (backend-specific)
         let chain = match &inner.backend {
-            WalBackend::SingleFile { wal_path, lsn_offsets, .. } => {
+            WalBackend::SingleFile {
+                wal_path,
+                lsn_offsets,
+                ..
+            } => {
                 let mut reader = WalReader::open(wal_path)?;
                 reader.collect_page_chain(page_id, latest_lsn, read_point, lsn_offsets)?
             }
-            WalBackend::Segmented { manager, lsn_offsets } => {
-                collect_segmented_chain(page_id, latest_lsn, read_point, lsn_offsets, manager)?
-            }
+            WalBackend::Segmented {
+                manager,
+                lsn_offsets,
+            } => collect_segmented_chain(page_id, latest_lsn, read_point, lsn_offsets, manager)?,
         };
 
         if chain.is_empty() {
@@ -462,8 +477,24 @@ mod tests {
         assert_eq!(state.vdl, 0);
 
         let records = vec![
-            RedoRecord { lsn: 0, page_id: 1, offset: 0, data: vec![1], prev_lsn: 0, mtr_id: 1, is_mtr_end: false },
-            RedoRecord { lsn: 0, page_id: 2, offset: 0, data: vec![2], prev_lsn: 0, mtr_id: 1, is_mtr_end: true },
+            RedoRecord {
+                lsn: 0,
+                page_id: 1,
+                offset: 0,
+                data: vec![1],
+                prev_lsn: 0,
+                mtr_id: 1,
+                is_mtr_end: false,
+            },
+            RedoRecord {
+                lsn: 0,
+                page_id: 2,
+                offset: 0,
+                data: vec![2],
+                prev_lsn: 0,
+                mtr_id: 1,
+                is_mtr_end: true,
+            },
         ];
         engine.append_redo(records).await.unwrap();
 
@@ -560,14 +591,24 @@ mod tests {
         let engine = new_tiered_engine(&dir);
 
         let r1 = vec![RedoRecord {
-            lsn: 0, page_id: 1, offset: 0, data: vec![0xAA],
-            prev_lsn: 0, mtr_id: 1, is_mtr_end: true,
+            lsn: 0,
+            page_id: 1,
+            offset: 0,
+            data: vec![0xAA],
+            prev_lsn: 0,
+            mtr_id: 1,
+            is_mtr_end: true,
         }];
         engine.append_redo(r1).await.unwrap();
 
         let r2 = vec![RedoRecord {
-            lsn: 0, page_id: 1, offset: 0, data: vec![0xBB],
-            prev_lsn: 0, mtr_id: 2, is_mtr_end: true,
+            lsn: 0,
+            page_id: 1,
+            offset: 0,
+            data: vec![0xBB],
+            prev_lsn: 0,
+            mtr_id: 2,
+            is_mtr_end: true,
         }];
         engine.append_redo(r2).await.unwrap();
 

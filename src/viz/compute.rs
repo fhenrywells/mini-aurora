@@ -139,7 +139,10 @@ impl VizComputeEngine {
             }
         }
 
-        let pages_str: Vec<String> = writes.iter().map(|(pid, _, _)| format!("pg{pid}")).collect();
+        let pages_str: Vec<String> = writes
+            .iter()
+            .map(|(pid, _, _)| format!("pg{pid}"))
+            .collect();
         self.set_active();
         self.render_op_header(&format!(
             "Node {}: PUT MULTI [{}]",
@@ -234,7 +237,10 @@ impl VizComputeEngine {
             inner.buffer_pool.insert(page_id, read_point, page);
         }
 
-        self.emit(&VizEvent::BufferPoolInsert { page_id, read_point });
+        self.emit(&VizEvent::BufferPoolInsert {
+            page_id,
+            read_point,
+        });
 
         self.emit_state_snapshot().await;
 
@@ -256,7 +262,10 @@ impl VizComputeEngine {
         inner.read_point = state.vdl;
         drop(inner);
 
-        self.emit(&VizEvent::UpdateReadPoint { old, new: state.vdl });
+        self.emit(&VizEvent::UpdateReadPoint {
+            old,
+            new: state.vdl,
+        });
         self.emit_state_snapshot().await;
 
         Ok(state.vdl)

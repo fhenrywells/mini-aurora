@@ -7,7 +7,6 @@ use mini_aurora_common::{Lsn, PageId};
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum VizEvent {
     // ── PUT path ──────────────────────────────────────────────────────
-
     /// A new mini-transaction was created.
     MtrCreated { mtr_id: u64, num_records: usize },
 
@@ -15,10 +14,19 @@ pub enum VizEvent {
     AssignLsns { first_lsn: Lsn, last_lsn: Lsn },
 
     /// A record's prev_lsn was linked to the chain for its page.
-    LinkPrevLsn { lsn: Lsn, page_id: PageId, prev_lsn: Lsn },
+    LinkPrevLsn {
+        lsn: Lsn,
+        page_id: PageId,
+        prev_lsn: Lsn,
+    },
 
     /// Records appended to the WAL file.
-    WalAppend { first_lsn: Lsn, last_lsn: Lsn, offset: u64, bytes: u64 },
+    WalAppend {
+        first_lsn: Lsn,
+        last_lsn: Lsn,
+        offset: u64,
+        bytes: u64,
+    },
 
     /// WAL fsync completed.
     WalSync,
@@ -42,24 +50,49 @@ pub enum VizEvent {
     BufferPoolInvalidate { page_id: PageId },
 
     // ── GET path ──────────────────────────────────────────────────────
-
     /// Buffer pool lookup on the compute side.
-    BufferPoolLookup { page_id: PageId, read_point: Lsn, hit: bool },
+    BufferPoolLookup {
+        page_id: PageId,
+        read_point: Lsn,
+        hit: bool,
+    },
 
     /// Storage-side page cache lookup.
-    PageCacheLookup { page_id: PageId, read_point: Lsn, hit: bool },
+    PageCacheLookup {
+        page_id: PageId,
+        read_point: Lsn,
+        hit: bool,
+    },
 
     /// Looked up the page index to find the latest LSN for a page.
-    PageIndexLookup { page_id: PageId, latest_lsn: Option<Lsn> },
+    PageIndexLookup {
+        page_id: PageId,
+        latest_lsn: Option<Lsn>,
+    },
 
     /// One step of the prev_lsn chain walk (backwards through WAL).
-    ChainWalkStep { page_id: PageId, lsn: Lsn, prev_lsn: Lsn, skipped: bool },
+    ChainWalkStep {
+        page_id: PageId,
+        lsn: Lsn,
+        prev_lsn: Lsn,
+        skipped: bool,
+    },
 
     /// Chain collection complete.
-    ChainCollected { page_id: PageId, chain_len: usize, lsns: Vec<Lsn> },
+    ChainCollected {
+        page_id: PageId,
+        chain_len: usize,
+        lsns: Vec<Lsn>,
+    },
 
     /// Applying one redo record during materialization.
-    MaterializeApply { page_id: PageId, lsn: Lsn, offset: u16, data_len: usize, data_preview: String },
+    MaterializeApply {
+        page_id: PageId,
+        lsn: Lsn,
+        offset: u16,
+        data_len: usize,
+        data_preview: String,
+    },
 
     /// Page materialization complete.
     MaterializeComplete { page_id: PageId, read_point: Lsn },
@@ -71,9 +104,12 @@ pub enum VizEvent {
     BufferPoolInsert { page_id: PageId, read_point: Lsn },
 
     // ── Tiered storage ────────────────────────────────────────────────
-
     /// A WAL segment was sealed and a new one opened.
-    SegmentRotation { sealed_id: u32, new_id: u32, sealed_lsn_range: (u64, u64) },
+    SegmentRotation {
+        sealed_id: u32,
+        new_id: u32,
+        sealed_lsn_range: (u64, u64),
+    },
 
     /// A read hit a cold-tier segment, incurring extra latency.
     ColdTierRead { segment_id: u32, latency_ms: u64 },
@@ -82,7 +118,6 @@ pub enum VizEvent {
     SegmentCooled { segment_id: u32 },
 
     // ── State ─────────────────────────────────────────────────────────
-
     /// Full system state snapshot for diagram rendering.
     StateSnapshot {
         // Compute state

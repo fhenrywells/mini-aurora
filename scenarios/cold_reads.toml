@@ -1,28 +1,15 @@
 [meta]
 name = "Cold Reads"
-description = "Write 100 distinct pages, then read all — tests cache miss rate and materialization"
+description = "Write and read a mixed page set — highlights first-read materialization and follow-up cache hits"
 
 [[steps]]
 op = "repeat"
-count = 100
+count = 40
 steps = [
-    { op = "put", page_id = 1, offset = 0, data = "cold-data" },
+    { op = "put", page_id = 1, offset = 0, data = "cold-data-1" },
+    { op = "put", page_id = 2, offset = 0, data = "cold-data-2" },
+    { op = "put", page_id = 3, offset = 0, data = "cold-data-3" },
 ]
-
-# The repeat above writes to page 1 each time. To write to distinct pages,
-# we use explicit steps for a representative set.
-
-[[steps]]
-op = "put"
-page_id = 2
-offset = 0
-data = "page-two"
-
-[[steps]]
-op = "put"
-page_id = 3
-offset = 0
-data = "page-three"
 
 [[steps]]
 op = "put"

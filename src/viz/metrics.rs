@@ -16,6 +16,10 @@ pub struct MetricsCollector {
     wal_bytes_written: u64,
     vcl: u64,
     vdl: u64,
+    segment_rotations: u64,
+    segments_cooled: u64,
+    cold_tier_reads: u64,
+    cold_latency_total_ms: u64,
     start_time: Instant,
 }
 
@@ -31,6 +35,10 @@ pub struct MetricsSummary {
     pub wal_bytes_written: u64,
     pub vcl: u64,
     pub vdl: u64,
+    pub segment_rotations: u64,
+    pub segments_cooled: u64,
+    pub cold_tier_reads: u64,
+    pub cold_latency_total_ms: u64,
     pub uptime_secs: f64,
 }
 
@@ -48,6 +56,10 @@ impl MetricsCollector {
             wal_bytes_written: 0,
             vcl: 0,
             vdl: 0,
+            segment_rotations: 0,
+            segments_cooled: 0,
+            cold_tier_reads: 0,
+            cold_latency_total_ms: 0,
             start_time: Instant::now(),
         }
     }
@@ -83,6 +95,16 @@ impl MetricsCollector {
             VizEvent::AdvanceVdl { new, .. } => {
                 self.vdl = *new;
             }
+            VizEvent::SegmentRotation { .. } => {
+                self.segment_rotations += 1;
+            }
+            VizEvent::SegmentCooled { .. } => {
+                self.segments_cooled += 1;
+            }
+            VizEvent::ColdTierRead { latency_ms, .. } => {
+                self.cold_tier_reads += 1;
+                self.cold_latency_total_ms += latency_ms;
+            }
             _ => {}
         }
     }
@@ -100,6 +122,10 @@ impl MetricsCollector {
             wal_bytes_written: self.wal_bytes_written,
             vcl: self.vcl,
             vdl: self.vdl,
+            segment_rotations: self.segment_rotations,
+            segments_cooled: self.segments_cooled,
+            cold_tier_reads: self.cold_tier_reads,
+            cold_latency_total_ms: self.cold_latency_total_ms,
             uptime_secs: self.start_time.elapsed().as_secs_f64(),
         }
     }

@@ -45,7 +45,10 @@ async fn test_multiple_records_compose() {
     let (_dir, storage) = setup();
     let compute = make_compute(storage);
 
-    compute.put(1, 0, vec![0x11, 0x22, 0x33, 0x44]).await.unwrap();
+    compute
+        .put(1, 0, vec![0x11, 0x22, 0x33, 0x44])
+        .await
+        .unwrap();
     compute.put(1, 8, vec![0xAA, 0xBB]).await.unwrap();
     compute.put(1, 2, vec![0xFF]).await.unwrap(); // overwrite byte 2
 
@@ -152,14 +155,36 @@ async fn test_crash_mid_mtr_recovery() {
     {
         let mut writer = WalWriter::open(&wal_path).unwrap();
         let complete_mtr = vec![
-            RedoRecord { lsn: 1, page_id: 1, offset: 0, data: vec![0xAA], prev_lsn: 0, mtr_id: 1, is_mtr_end: false },
-            RedoRecord { lsn: 2, page_id: 2, offset: 0, data: vec![0xBB], prev_lsn: 0, mtr_id: 1, is_mtr_end: true },
+            RedoRecord {
+                lsn: 1,
+                page_id: 1,
+                offset: 0,
+                data: vec![0xAA],
+                prev_lsn: 0,
+                mtr_id: 1,
+                is_mtr_end: false,
+            },
+            RedoRecord {
+                lsn: 2,
+                page_id: 2,
+                offset: 0,
+                data: vec![0xBB],
+                prev_lsn: 0,
+                mtr_id: 1,
+                is_mtr_end: true,
+            },
         ];
         writer.append_batch(&complete_mtr).unwrap();
 
-        let incomplete_mtr = vec![
-            RedoRecord { lsn: 3, page_id: 3, offset: 0, data: vec![0xCC], prev_lsn: 0, mtr_id: 2, is_mtr_end: false },
-        ];
+        let incomplete_mtr = vec![RedoRecord {
+            lsn: 3,
+            page_id: 3,
+            offset: 0,
+            data: vec![0xCC],
+            prev_lsn: 0,
+            mtr_id: 2,
+            is_mtr_end: false,
+        }];
         writer.append_batch(&incomplete_mtr).unwrap();
         writer.sync().unwrap();
     }
@@ -322,9 +347,33 @@ async fn test_durability_tracking() {
 
     // Write with CPL
     let records = vec![
-        RedoRecord { lsn: 0, page_id: 1, offset: 0, data: vec![1], prev_lsn: 0, mtr_id: 1, is_mtr_end: false },
-        RedoRecord { lsn: 0, page_id: 2, offset: 0, data: vec![2], prev_lsn: 0, mtr_id: 1, is_mtr_end: false },
-        RedoRecord { lsn: 0, page_id: 3, offset: 0, data: vec![3], prev_lsn: 0, mtr_id: 1, is_mtr_end: true },
+        RedoRecord {
+            lsn: 0,
+            page_id: 1,
+            offset: 0,
+            data: vec![1],
+            prev_lsn: 0,
+            mtr_id: 1,
+            is_mtr_end: false,
+        },
+        RedoRecord {
+            lsn: 0,
+            page_id: 2,
+            offset: 0,
+            data: vec![2],
+            prev_lsn: 0,
+            mtr_id: 1,
+            is_mtr_end: false,
+        },
+        RedoRecord {
+            lsn: 0,
+            page_id: 3,
+            offset: 0,
+            data: vec![3],
+            prev_lsn: 0,
+            mtr_id: 1,
+            is_mtr_end: true,
+        },
     ];
     storage.append_redo(records).await.unwrap();
 
@@ -333,9 +382,15 @@ async fn test_durability_tracking() {
     assert_eq!(state.vdl, 3);
 
     // Write without CPL (incomplete MTR)
-    let records = vec![
-        RedoRecord { lsn: 0, page_id: 4, offset: 0, data: vec![4], prev_lsn: 0, mtr_id: 2, is_mtr_end: false },
-    ];
+    let records = vec![RedoRecord {
+        lsn: 0,
+        page_id: 4,
+        offset: 0,
+        data: vec![4],
+        prev_lsn: 0,
+        mtr_id: 2,
+        is_mtr_end: false,
+    }];
     storage.append_redo(records).await.unwrap();
 
     let state = storage.get_durability_state().await.unwrap();

@@ -160,7 +160,13 @@ mod tests {
     use mini_aurora_common::{RedoRecord, LOG_ENTRY_HEADER_SIZE};
     use tempfile::NamedTempFile;
 
-    fn make_record(lsn: Lsn, page_id: PageId, prev_lsn: Lsn, mtr_id: u64, is_end: bool) -> RedoRecord {
+    fn make_record(
+        lsn: Lsn,
+        page_id: PageId,
+        prev_lsn: Lsn,
+        mtr_id: u64,
+        is_end: bool,
+    ) -> RedoRecord {
         RedoRecord {
             lsn,
             page_id,
@@ -205,7 +211,7 @@ mod tests {
         let records = vec![
             make_record(1, 1, 0, 1, false),
             make_record(2, 2, 0, 1, false),
-            make_record(3, 1, 1, 1, true),  // CPL for MTR 1
+            make_record(3, 1, 1, 1, true), // CPL for MTR 1
             make_record(4, 3, 0, 2, false),
             make_record(5, 1, 3, 2, false), // no CPL — incomplete MTR
         ];
@@ -232,8 +238,8 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let records = vec![
-            make_record(1, 1, 0, 1, true),  // complete MTR
-            make_record(2, 2, 0, 2, true),  // complete MTR
+            make_record(1, 1, 0, 1, true), // complete MTR
+            make_record(2, 2, 0, 2, true), // complete MTR
         ];
 
         let mut writer = WalWriter::open(&path).unwrap();
@@ -261,10 +267,7 @@ mod tests {
 
         // Simulate gap: LSNs 1, 2, 4 (missing 3)
         // In practice this shouldn't happen on single machine but tests VCL logic
-        let records = vec![
-            make_record(1, 1, 0, 1, true),
-            make_record(2, 2, 0, 2, true),
-        ];
+        let records = vec![make_record(1, 1, 0, 1, true), make_record(2, 2, 0, 2, true)];
 
         let mut writer = WalWriter::open(&path).unwrap();
         writer.append_batch(&records).unwrap();

@@ -35,7 +35,13 @@ fn apply_redo(page: &mut Page, record: &RedoRecord) -> Result<(), StorageError> 
 mod tests {
     use super::*;
 
-    fn make_redo(lsn: u64, page_id: PageId, offset: u16, data: Vec<u8>, prev_lsn: u64) -> RedoRecord {
+    fn make_redo(
+        lsn: u64,
+        page_id: PageId,
+        offset: u16,
+        data: Vec<u8>,
+        prev_lsn: u64,
+    ) -> RedoRecord {
         RedoRecord {
             lsn,
             page_id,

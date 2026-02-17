@@ -277,9 +277,33 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let records = vec![
-            RedoRecord { lsn: 1, page_id: 1, offset: 0, data: vec![1], prev_lsn: 0, mtr_id: 1, is_mtr_end: false },
-            RedoRecord { lsn: 2, page_id: 2, offset: 0, data: vec![2], prev_lsn: 0, mtr_id: 1, is_mtr_end: false },
-            RedoRecord { lsn: 3, page_id: 1, offset: 4, data: vec![3], prev_lsn: 1, mtr_id: 1, is_mtr_end: true },
+            RedoRecord {
+                lsn: 1,
+                page_id: 1,
+                offset: 0,
+                data: vec![1],
+                prev_lsn: 0,
+                mtr_id: 1,
+                is_mtr_end: false,
+            },
+            RedoRecord {
+                lsn: 2,
+                page_id: 2,
+                offset: 0,
+                data: vec![2],
+                prev_lsn: 0,
+                mtr_id: 1,
+                is_mtr_end: false,
+            },
+            RedoRecord {
+                lsn: 3,
+                page_id: 1,
+                offset: 4,
+                data: vec![3],
+                prev_lsn: 1,
+                mtr_id: 1,
+                is_mtr_end: true,
+            },
         ];
 
         let mut writer = WalWriter::open(&path).unwrap();
@@ -303,11 +327,51 @@ mod tests {
         // Page 1: LSN 1 → LSN 3 → LSN 5
         // Page 2: LSN 2 → LSN 4
         let records = vec![
-            RedoRecord { lsn: 1, page_id: 1, offset: 0, data: vec![0xA], prev_lsn: 0, mtr_id: 1, is_mtr_end: true },
-            RedoRecord { lsn: 2, page_id: 2, offset: 0, data: vec![0xB], prev_lsn: 0, mtr_id: 2, is_mtr_end: true },
-            RedoRecord { lsn: 3, page_id: 1, offset: 1, data: vec![0xC], prev_lsn: 1, mtr_id: 3, is_mtr_end: true },
-            RedoRecord { lsn: 4, page_id: 2, offset: 1, data: vec![0xD], prev_lsn: 2, mtr_id: 4, is_mtr_end: true },
-            RedoRecord { lsn: 5, page_id: 1, offset: 2, data: vec![0xE], prev_lsn: 3, mtr_id: 5, is_mtr_end: true },
+            RedoRecord {
+                lsn: 1,
+                page_id: 1,
+                offset: 0,
+                data: vec![0xA],
+                prev_lsn: 0,
+                mtr_id: 1,
+                is_mtr_end: true,
+            },
+            RedoRecord {
+                lsn: 2,
+                page_id: 2,
+                offset: 0,
+                data: vec![0xB],
+                prev_lsn: 0,
+                mtr_id: 2,
+                is_mtr_end: true,
+            },
+            RedoRecord {
+                lsn: 3,
+                page_id: 1,
+                offset: 1,
+                data: vec![0xC],
+                prev_lsn: 1,
+                mtr_id: 3,
+                is_mtr_end: true,
+            },
+            RedoRecord {
+                lsn: 4,
+                page_id: 2,
+                offset: 1,
+                data: vec![0xD],
+                prev_lsn: 2,
+                mtr_id: 4,
+                is_mtr_end: true,
+            },
+            RedoRecord {
+                lsn: 5,
+                page_id: 1,
+                offset: 2,
+                data: vec![0xE],
+                prev_lsn: 3,
+                mtr_id: 5,
+                is_mtr_end: true,
+            },
         ];
 
         let mut writer = WalWriter::open(&path).unwrap();

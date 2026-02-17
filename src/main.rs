@@ -21,6 +21,45 @@ use viz::tracer::JsonTracer;
 
 mod scenario;
 
+struct LearnModule {
+    number: u8,
+    title: &'static str,
+    goal: &'static str,
+    scenario_file: &'static str,
+    recommended_preset: &'static str,
+}
+
+const LEARN_MODULES: [LearnModule; 4] = [
+    LearnModule {
+        number: 1,
+        title: "WAL Basics",
+        goal: "Single-node writes, refresh, and read-back from the log-backed page store.",
+        scenario_file: "scenarios/01_wal_basics.toml",
+        recommended_preset: "base",
+    },
+    LearnModule {
+        number: 2,
+        title: "Read Isolation",
+        goal: "Two compute nodes with independent read points (stale read then refresh).",
+        scenario_file: "scenarios/02_read_isolation.toml",
+        recommended_preset: "base",
+    },
+    LearnModule {
+        number: 3,
+        title: "Materialization & Cache",
+        goal: "Observe first-read materialization and second-read cache hits across pages.",
+        scenario_file: "scenarios/03_materialization_cache.toml",
+        recommended_preset: "base",
+    },
+    LearnModule {
+        number: 4,
+        title: "Tiered WAL",
+        goal: "Segment rotation and cross-node reads with hot/cold WAL tiers.",
+        scenario_file: "scenarios/04_tiered_wal.toml",
+        recommended_preset: "tiered",
+    },
+];
+
 // ---------------------------------------------------------------------------
 // Viz REPL types
 // ---------------------------------------------------------------------------
@@ -53,7 +92,10 @@ impl VizGuard {
             r.config_mut().enabled = false;
             e
         };
-        Self { renderer: renderer.clone(), was_enabled }
+        Self {
+            renderer: renderer.clone(),
+            was_enabled,
+        }
     }
 }
 
@@ -117,20 +159,62 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         "demo" => run_demo().await?,
         "repl" => run_repl().await?,
+        "learn" => {
+            run_learn_cli(
+                &args,
+                trace_json_path.as_deref(),
+                &preset,
+                segment_size,
+                cold_latency_ms,
+            )
+            .await?
+        }
         "viz-demo" => run_viz_demo(delay_ms, !no_color).await?,
-        "viz-repl" => run_viz_repl(delay_ms, !no_color, trace_json_path, &preset, segment_size, cold_latency_ms).await?,
+        "viz-repl" => {
+            run_viz_repl(
+                delay_ms,
+                !no_color,
+                trace_json_path,
+                &preset,
+                segment_size,
+                cold_latency_ms,
+            )
+            .await?
+        }
         "scenario" => {
-            let scenario_path = args.get(2).cloned().unwrap_or_else(|| {
+            let scenario_arg = args.get(2).cloned().unwrap_or_else(|| {
                 eprintln!("Usage: mini-aurora scenario <file.toml> [--preset base|tiered] [--trace-json path]");
+                eprintln!("       mini-aurora scenario --list");
                 std::process::exit(1);
             });
-            scenario::run_scenario_cli(&scenario_path, &preset, trace_json_path.as_deref(), segment_size, cold_latency_ms).await?;
+            if scenario_arg == "--list" || scenario_arg == "list" {
+                print_scenario_catalog();
+            } else {
+                scenario::run_scenario_cli(
+                    &scenario_arg,
+                    &preset,
+                    trace_json_path.as_deref(),
+                    segment_size,
+                    cold_latency_ms,
+                )
+                .await?;
+            }
+        }
+        "compare" => {
+            let scenario_path = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: mini-aurora compare <file.toml> [--segment-size <bytes>] [--cold-latency-ms <ms>]");
+                std::process::exit(1);
+            });
+            scenario::run_scenario_compare(&scenario_path, segment_size, cold_latency_ms).await?;
         }
         _ => {
-            eprintln!("Usage: mini-aurora [demo|repl|viz-demo|viz-repl|scenario] [--delay <ms>] [--no-color]");
+            eprintln!("Usage: mini-aurora [demo|repl|learn|viz-demo|viz-repl|scenario|compare] [--delay <ms>] [--no-color]");
             eprintln!("       [--preset base|tiered] [--trace-json path]");
             eprintln!("       [--segment-size <bytes>] [--cold-latency-ms <ms>]");
+            eprintln!("       mini-aurora learn [path|run <1|2|3|4|all>]");
             eprintln!("       mini-aurora scenario <file.toml> [flags...]");
+            eprintln!("       mini-aurora scenario --list");
+            eprintln!("       mini-aurora compare <file.toml> [flags...]");
             std::process::exit(1);
         }
     }
@@ -152,6 +236,110 @@ fn parse_flag_string(args: &[String], flag: &str) -> Option<String> {
         .map(|v| v.clone())
 }
 
+fn print_learning_path() {
+    println!("=== Mini-Aurora Learning Path ===");
+    println!("Run modules in order. Each module maps to one scenario and one Aurora concept.\n");
+    for m in &LEARN_MODULES {
+        println!("{}. {} [{}]", m.number, m.title, m.recommended_preset);
+        println!("   Goal: {}", m.goal);
+        println!("   Run:  cargo run -- learn run {}", m.number);
+        if m.recommended_preset == "tiered" {
+            println!(
+                "         cargo run -- learn run {} --preset tiered",
+                m.number
+            );
+        }
+    }
+    println!("\nRun all modules: cargo run -- learn run all");
+    println!("List scenarios:  cargo run -- scenario --list");
+}
+
+fn print_scenario_catalog() {
+    println!("=== Scenarios ===");
+    println!("Progressive modules:");
+    for m in &LEARN_MODULES {
+        println!("  {}. {:<22} {}", m.number, m.scenario_file, m.goal);
+    }
+    println!("\nAdvanced workloads:");
+    println!("  scenarios/burst.toml               Burst writes and repeated reads");
+    println!("  scenarios/cold_reads.toml          Cache miss/hit pattern across pages");
+    println!("  scenarios/noisy_neighbor.toml      Stale-reader behavior under write churn");
+    println!("  scenarios/tiered_demo.toml         Segment rotation with tiered storage");
+}
+
+async fn run_learn_cli(
+    args: &[String],
+    trace_json: Option<&str>,
+    preset: &str,
+    segment_size: u64,
+    cold_latency_ms: u64,
+) -> anyhow::Result<()> {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("path");
+    match sub {
+        "path" | "list" => {
+            print_learning_path();
+            Ok(())
+        }
+        "run" => {
+            let target = args.get(3).map(|s| s.as_str()).unwrap_or("1");
+            if target == "all" {
+                for module in &LEARN_MODULES {
+                    let selected_preset = if preset == "base" {
+                        module.recommended_preset
+                    } else {
+                        preset
+                    };
+                    println!(
+                        "\n=== Learn {}: {} (preset: {}) ===",
+                        module.number, module.title, selected_preset
+                    );
+                    scenario::run_scenario_cli(
+                        module.scenario_file,
+                        selected_preset,
+                        trace_json,
+                        segment_size,
+                        cold_latency_ms,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+
+            let module_num: u8 = target.parse().map_err(|_| {
+                anyhow::anyhow!("Invalid module '{target}'. Use 1, 2, 3, 4, or all.")
+            })?;
+            let module = LEARN_MODULES
+                .iter()
+                .find(|m| m.number == module_num)
+                .ok_or_else(|| anyhow::anyhow!("Unknown module {module_num}. Use 1..4."))?;
+
+            let selected_preset = if preset == "base" {
+                module.recommended_preset
+            } else {
+                preset
+            };
+
+            println!(
+                "=== Learn {}: {} (preset: {}) ===",
+                module.number, module.title, selected_preset
+            );
+            println!("Goal: {}\n", module.goal);
+            scenario::run_scenario_cli(
+                module.scenario_file,
+                selected_preset,
+                trace_json,
+                segment_size,
+                cold_latency_ms,
+            )
+            .await
+        }
+        _ => {
+            eprintln!("Usage: mini-aurora learn [path|run <1|2|3|4|all>]");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn run_demo() -> anyhow::Result<()> {
     println!("=== Mini-Aurora Demo ===\n");
 
@@ -164,14 +352,10 @@ async fn run_demo() -> anyhow::Result<()> {
 
     // 1. Write some data
     println!("Writing 'Hello, Aurora!' to page 1 at offset 0...");
-    compute
-        .put(1, 0, b"Hello, Aurora!".to_vec())
-        .await?;
+    compute.put(1, 0, b"Hello, Aurora!".to_vec()).await?;
 
     println!("Writing 'Log is the DB' to page 2 at offset 0...");
-    compute
-        .put(2, 0, b"Log is the DB".to_vec())
-        .await?;
+    compute.put(2, 0, b"Log is the DB".to_vec()).await?;
 
     // 2. Read it back
     let page1 = compute.get(1).await?;
@@ -192,10 +376,7 @@ async fn run_demo() -> anyhow::Result<()> {
     for pid in 3..=5 {
         let page = compute.get(pid).await?;
         let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
-        println!(
-            "Page {pid}: {:?}",
-            String::from_utf8_lossy(&page[..end])
-        );
+        println!("Page {pid}: {:?}", String::from_utf8_lossy(&page[..end]));
     }
 
     // 4. Show durability state
@@ -253,11 +434,17 @@ async fn run_repl() -> anyhow::Result<()> {
                 }
                 let page_id: PageId = match parts[1].parse() {
                     Ok(v) => v,
-                    Err(_) => { println!("Invalid page_id"); continue; }
+                    Err(_) => {
+                        println!("Invalid page_id");
+                        continue;
+                    }
                 };
                 let offset: u16 = match parts[2].parse() {
                     Ok(v) => v,
-                    Err(_) => { println!("Invalid offset"); continue; }
+                    Err(_) => {
+                        println!("Invalid offset");
+                        continue;
+                    }
                 };
                 let data = parts[3].as_bytes().to_vec();
                 match compute.put(page_id, offset, data).await {
@@ -272,7 +459,10 @@ async fn run_repl() -> anyhow::Result<()> {
                 }
                 let page_id: PageId = match parts[1].parse() {
                     Ok(v) => v,
-                    Err(_) => { println!("Invalid page_id"); continue; }
+                    Err(_) => {
+                        println!("Invalid page_id");
+                        continue;
+                    }
                 };
                 match compute.get(page_id).await {
                     Ok(page) => {
@@ -286,12 +476,10 @@ async fn run_repl() -> anyhow::Result<()> {
                     Err(e) => println!("Error: {e}"),
                 }
             }
-            "state" => {
-                match storage.get_durability_state().await {
-                    Ok(s) => println!("{s}"),
-                    Err(e) => println!("Error: {e}"),
-                }
-            }
+            "state" => match storage.get_durability_state().await {
+                Ok(s) => println!("{s}"),
+                Err(e) => println!("Error: {e}"),
+            },
             "quit" | "exit" | "q" => break,
             other => println!("Unknown command: {other}"),
         }
@@ -372,7 +560,14 @@ async fn run_viz_demo(delay_ms: u64, color: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_viz_repl(delay_ms: u64, color: bool, trace_json: Option<String>, preset: &str, segment_size: u64, cold_latency_ms: u64) -> anyhow::Result<()> {
+async fn run_viz_repl(
+    delay_ms: u64,
+    color: bool,
+    trace_json: Option<String>,
+    preset: &str,
+    segment_size: u64,
+    cold_latency_ms: u64,
+) -> anyhow::Result<()> {
     println!("=== Mini-Aurora Viz REPL (preset: {preset}) ===");
     println!("Commands: put <page> <offset> <text>, get <page>, refresh");
     println!("          node A|B, state, metrics, bg <node> write|read|mixed <ms>");
@@ -397,8 +592,15 @@ async fn run_viz_repl(delay_ms: u64, color: bool, trace_json: Option<String>, pr
             let base_dir = PathBuf::from("/tmp/mini-aurora-viz-tiered");
             let _ = std::fs::remove_dir_all(&base_dir);
             let cold_latency = Duration::from_millis(cold_latency_ms);
-            println!("Tiered storage: segment_size={segment_size}B, cold_latency={cold_latency_ms}ms");
-            Arc::new(VizStorageEngine::open_tiered(&base_dir, segment_size, cold_latency, renderer.clone())?)
+            println!(
+                "Tiered storage: segment_size={segment_size}B, cold_latency={cold_latency_ms}ms"
+            );
+            Arc::new(VizStorageEngine::open_tiered(
+                &base_dir,
+                segment_size,
+                cold_latency,
+                renderer.clone(),
+            )?)
         }
         _ => {
             let wal_path = PathBuf::from("/tmp/mini-aurora-viz-repl.wal");
@@ -407,10 +609,16 @@ async fn run_viz_repl(delay_ms: u64, color: bool, trace_json: Option<String>, pr
     };
 
     let node_a = Arc::new(VizComputeEngine::new(
-        storage.clone(), 256, renderer.clone(), "A".to_string(),
+        storage.clone(),
+        256,
+        renderer.clone(),
+        "A".to_string(),
     ));
     let node_b = Arc::new(VizComputeEngine::new(
-        storage.clone(), 256, renderer.clone(), "B".to_string(),
+        storage.clone(),
+        256,
+        renderer.clone(),
+        "B".to_string(),
     ));
 
     node_a.refresh_read_point().await?;
@@ -681,7 +889,11 @@ async fn run_viz_repl(delay_ms: u64, color: bool, trace_json: Option<String>, pr
 }
 
 fn other_node(current: &str) -> &'static str {
-    if current == "A" { "B" } else { "A" }
+    if current == "A" {
+        "B"
+    } else {
+        "A"
+    }
 }
 
 fn update_suggestions(state: &mut ReplState, outcome: &CommandOutcome) {
@@ -690,7 +902,9 @@ fn update_suggestions(state: &mut ReplState, outcome: &CommandOutcome) {
         CommandOutcome::Put { page_id } => {
             state.suggestions.push(format!("get {page_id}"));
             state.suggestions.push(format!("put {page_id} 0 updated"));
-            state.suggestions.push(format!("node {}", other_node(&state.current_node)));
+            state
+                .suggestions
+                .push(format!("node {}", other_node(&state.current_node)));
         }
         CommandOutcome::GetSuccess { page_id } => {
             state.suggestions.push(format!("put {page_id} 0 new-data"));
@@ -700,12 +914,16 @@ fn update_suggestions(state: &mut ReplState, outcome: &CommandOutcome) {
         CommandOutcome::GetFailure { page_id } => {
             state.suggestions.push("refresh".to_string());
             state.suggestions.push(format!("put {page_id} 0 Hello"));
-            state.suggestions.push(format!("node {}", other_node(&state.current_node)));
+            state
+                .suggestions
+                .push(format!("node {}", other_node(&state.current_node)));
         }
         CommandOutcome::Refresh => {
             state.suggestions.push("get 1".to_string());
             state.suggestions.push("state".to_string());
-            state.suggestions.push(format!("node {}", other_node(&state.current_node)));
+            state
+                .suggestions
+                .push(format!("node {}", other_node(&state.current_node)));
         }
         CommandOutcome::NodeSwitch => {
             state.suggestions.push("refresh".to_string());
@@ -737,17 +955,39 @@ fn print_suggestions(state: &ReplState) {
         return;
     }
     let descs = |cmd: &str| -> &str {
-        if cmd.starts_with("get ") { return "read the page"; }
-        if cmd.starts_with("put ") && cmd.contains("updated") { return "overwrite with new data"; }
-        if cmd.starts_with("put ") && cmd.contains("new-data") { return "overwrite with new data"; }
-        if cmd.starts_with("put ") && cmd.contains("Hello") { return "write data to the page"; }
-        if cmd.starts_with("put ") { return "write to a page"; }
-        if cmd == "refresh" { return "advance read_point to VDL"; }
-        if cmd.starts_with("node ") { return "switch compute node"; }
-        if cmd == "state" { return "show durability watermarks"; }
-        if cmd.starts_with("bg stop") { return "stop the background worker"; }
-        if cmd == "bg list" { return "show running workers"; }
-        if cmd.starts_with("bg ") { return "start background worker"; }
+        if cmd.starts_with("get ") {
+            return "read the page";
+        }
+        if cmd.starts_with("put ") && cmd.contains("updated") {
+            return "overwrite with new data";
+        }
+        if cmd.starts_with("put ") && cmd.contains("new-data") {
+            return "overwrite with new data";
+        }
+        if cmd.starts_with("put ") && cmd.contains("Hello") {
+            return "write data to the page";
+        }
+        if cmd.starts_with("put ") {
+            return "write to a page";
+        }
+        if cmd == "refresh" {
+            return "advance read_point to VDL";
+        }
+        if cmd.starts_with("node ") {
+            return "switch compute node";
+        }
+        if cmd == "state" {
+            return "show durability watermarks";
+        }
+        if cmd.starts_with("bg stop") {
+            return "stop the background worker";
+        }
+        if cmd == "bg list" {
+            return "show running workers";
+        }
+        if cmd.starts_with("bg ") {
+            return "start background worker";
+        }
         ""
     };
     for (i, cmd) in state.suggestions.iter().enumerate() {
@@ -867,46 +1107,79 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
                             WorkerKind::Write => {
                                 let pg = bg_counter.fetch_add(1, Ordering::Relaxed);
                                 match bg_compute.put(pg, 0, format!("bg-{pg}").into_bytes()).await {
-                                    Ok(vdl) => { let _ = bg_tx.send(format!("[bg {node_label}] PUT pg{pg} OK (VDL={vdl})")); }
-                                    Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] PUT pg{pg} Error: {e}")); }
+                                    Ok(vdl) => {
+                                        let _ = bg_tx.send(format!(
+                                            "[bg {node_label}] PUT pg{pg} OK (VDL={vdl})"
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = bg_tx.send(format!(
+                                            "[bg {node_label}] PUT pg{pg} Error: {e}"
+                                        ));
+                                    }
                                 }
                             }
                             WorkerKind::Read => {
                                 let pg = (cycle % 10) + 1;
                                 match bg_compute.get(pg).await {
                                     Ok(page) => {
-                                        let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
+                                        let end =
+                                            page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
                                         let preview = if end == 0 {
                                             "(empty)".to_string()
                                         } else {
                                             let s = String::from_utf8_lossy(&page[..end.min(20)]);
                                             format!("{:?}", s)
                                         };
-                                        let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} -> {preview}"));
+                                        let _ = bg_tx.send(format!(
+                                            "[bg {node_label}] GET pg{pg} -> {preview}"
+                                        ));
                                     }
-                                    Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} Error: {e}")); }
+                                    Err(e) => {
+                                        let _ = bg_tx.send(format!(
+                                            "[bg {node_label}] GET pg{pg} Error: {e}"
+                                        ));
+                                    }
                                 }
                             }
                             WorkerKind::Mixed => {
                                 if cycle % 2 == 0 {
                                     match bg_compute.refresh_read_point().await {
-                                        Ok(rp) => { let _ = bg_tx.send(format!("[bg {node_label}] REFRESH -> rp={rp}")); }
-                                        Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] REFRESH Error: {e}")); }
+                                        Ok(rp) => {
+                                            let _ = bg_tx.send(format!(
+                                                "[bg {node_label}] REFRESH -> rp={rp}"
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            let _ = bg_tx.send(format!(
+                                                "[bg {node_label}] REFRESH Error: {e}"
+                                            ));
+                                        }
                                     }
                                 } else {
                                     let pg = ((cycle / 2) % 10) + 1;
                                     match bg_compute.get(pg).await {
                                         Ok(page) => {
-                                            let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
+                                            let end = page
+                                                .iter()
+                                                .position(|&b| b == 0)
+                                                .unwrap_or(PAGE_SIZE);
                                             let preview = if end == 0 {
                                                 "(empty)".to_string()
                                             } else {
-                                                let s = String::from_utf8_lossy(&page[..end.min(20)]);
+                                                let s =
+                                                    String::from_utf8_lossy(&page[..end.min(20)]);
                                                 format!("{:?}", s)
                                             };
-                                            let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} -> {preview}"));
+                                            let _ = bg_tx.send(format!(
+                                                "[bg {node_label}] GET pg{pg} -> {preview}"
+                                            ));
                                         }
-                                        Err(e) => { let _ = bg_tx.send(format!("[bg {node_label}] GET pg{pg} Error: {e}")); }
+                                        Err(e) => {
+                                            let _ = bg_tx.send(format!(
+                                                "[bg {node_label}] GET pg{pg} Error: {e}"
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -921,12 +1194,15 @@ async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutc
                 }
             });
 
-            state.workers.insert(target.clone(), WorkerHandle {
-                cancel,
-                kind,
-                interval_ms,
-                task,
-            });
+            state.workers.insert(
+                target.clone(),
+                WorkerHandle {
+                    cancel,
+                    kind,
+                    interval_ms,
+                    task,
+                },
+            );
             println!("Started bg {kind} worker on Node {target} every {interval_ms}ms");
             CommandOutcome::BgStarted { node: target }
         }

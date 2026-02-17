@@ -20,7 +20,7 @@ impl MiniTransaction {
     /// LSN and prev_lsn will be assigned by the storage engine.
     pub fn write(&mut self, page_id: PageId, offset: u16, data: Vec<u8>) {
         self.records.push(RedoRecord {
-            lsn: 0,     // assigned by storage
+            lsn: 0, // assigned by storage
             page_id,
             offset,
             data,

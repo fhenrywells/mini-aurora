@@ -14,10 +14,7 @@ pub struct WalWriter {
 impl WalWriter {
     /// Open (or create) a WAL file for appending.
     pub fn open(path: &Path) -> Result<Self, std::io::Error> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
         })

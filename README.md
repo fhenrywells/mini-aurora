@@ -47,22 +47,33 @@ Aurora's key insight is that the write-ahead log (WAL) _is_ the database — pag
 
 ## Quick Start
 
-Each mode builds on the last, so start at the top and work down.
+Use the built-in learning path first. It is intentionally progressive.
 
 ```bash
-# 1. Scripted demo — writes pages, reads them back, shows versioning
-cargo run -- demo
+# Show the module path
+cargo run -- learn
 
-# 2. Interactive REPL — try put/get/state yourself
+# Run modules one-by-one
+cargo run -- learn run 1
+cargo run -- learn run 2
+cargo run -- learn run 3
+
+# Module 4 is tiered WAL (recommended preset: tiered)
+cargo run -- learn run 4 --preset tiered
+
+# Or run everything in sequence
+cargo run -- learn run all
+```
+
+After the learning path, use these modes for deeper exploration:
+
+```bash
+# Scripted and interactive basics
+cargo run -- demo
 cargo run -- repl
 
-# 3. Visualization demo — the same writes from (1) but with step-by-step
-#    ASCII diagrams showing every internal operation (WAL append, chain
-#    walk, materialization, cache inserts, etc.)
+# Step-by-step visualization and full concurrency REPL
 cargo run -- viz-demo
-
-# 4. Visualization REPL — full interactive mode with two compute nodes,
-#    contextual suggestions, background workers, and metrics
 cargo run -- viz-repl
 ```
 
@@ -141,10 +152,20 @@ cargo run -- scenario scenarios/burst.toml
 
 ### Included scenarios
 
+List them from the CLI:
+
+```bash
+cargo run -- scenario --list
+```
+
 | File | What it tests |
 |------|---------------|
+| `scenarios/01_wal_basics.toml` | Single-node WAL write/read flow |
+| `scenarios/02_read_isolation.toml` | Stale read then refresh across nodes |
+| `scenarios/03_materialization_cache.toml` | Materialization on first read, cache hits on second read |
+| `scenarios/04_tiered_wal.toml` | Tiered WAL segment rotation and cross-node reads |
 | `scenarios/burst.toml` | 50 rapid writes then reads — WAL throughput and cache churn |
-| `scenarios/cold_reads.toml` | Write many distinct pages, read them all — cache miss rate and materialization |
+| `scenarios/cold_reads.toml` | Repeated reads across a mixed page set — cache miss/hit behavior |
 | `scenarios/noisy_neighbor.toml` | Node A does heavy writes while Node B reads with a stale read point |
 | `scenarios/tiered_demo.toml` | Fills segments to trigger rotation, reads across hot and cold tiers |
 
@@ -190,6 +211,52 @@ steps = [
     { op = "put", page_id = 1, offset = 0, data = "loop" },
 ]
 ```
+
+## Side-by-Side Comparison
+
+The `compare` subcommand runs the **same scenario against both backends** (BASE and TIERED) headlessly and prints a unified 84-character-wide comparison table. Step results are aligned row-by-row; a `←` marker appears on any row where the two values differ.
+
+```bash
+cargo run -- compare scenarios/tiered_demo.toml --segment-size 512
+```
+
+Example output:
+
+```
+=== Compare: Tiered Storage Demo ===
+Running BASE    ... done  (120 appends, 0.4s, all data on fast local storage)
+Running TIERED  ... done  (120 appends, 2.3s total, 1700ms cold overhead, 10 segs sealed → cold storage)
+╔══════════════════════════════════════════╤════════════════════╤════════════════════════╗
+║ Step                                     │ BASE               │ TIERED                 ║
+╠══════════════════════════════════════════╪════════════════════╪════════════════════════╣
+║ [A] PUT pg1 @0                           │ VDL=1              │ VDL=1                  ║
+║ repeat 10× (put pg1, put pg2)            │ (done)             │ (done)                 ║
+║ ...                                      │ ...                │ ...                    ║
+╠══════════════════════════════════════════╪════════════════════╪════════════════════════╣
+║ WAL appends                              │ 120                │ 120                    ║
+║ Segment rotations                        │ —                  │ 12                   ← ║
+║ Segments cooled                          │ —                  │ 10                   ← ║
+║ Cold tier reads                          │ —                  │ 34                   ← ║
+║ Cache hit rate                           │ 72%                │ 72%                    ║
+╚══════════════════════════════════════════╧════════════════════╧════════════════════════╝
+```
+
+Step rows with `←` indicate a correctness divergence — both backends should produce identical results for the same operations. The tiered-only metrics rows (`Segments sealed`, `Segments on cold storage`, `Cold storage reads`, `Cold read overhead`) are expected to show `←`: sealed segments represent data evicted to cheaper storage, and the cold read overhead shows exactly where the extra elapsed time went — not write performance, but simulated object-storage read latency.
+
+`compare` always runs both backends; `--preset` is not accepted. Tuning flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--segment-size <bytes>` | 4096 | WAL segment size (tiered run) |
+| `--cold-latency-ms <ms>` | 50 | Artificial cold-read latency (tiered run) |
+
+Use small segment sizes to force more rotations and make the difference more visible:
+
+```bash
+cargo run -- compare scenarios/cold_reads.toml --segment-size 512 --cold-latency-ms 10
+```
+
+---
 
 ## Metrics & Tracing
 
@@ -262,5 +329,5 @@ cargo test --workspace
 | `--no-color` | `viz-demo`, `viz-repl` | off | Disable ANSI color codes |
 | `--trace-json <path>` | `viz-repl`, `scenario` | — | Write events as newline-delimited JSON |
 | `--preset base\|tiered` | `viz-repl`, `scenario` | `base` | Storage engine variant |
-| `--segment-size <bytes>` | `viz-repl`, `scenario` (tiered) | 4096 | WAL segment size before rotation |
-| `--cold-latency-ms <ms>` | `viz-repl`, `scenario` (tiered) | 50 | Artificial latency for cold segment reads |
+| `--segment-size <bytes>` | `viz-repl`, `scenario` (tiered), `compare` | 4096 | WAL segment size before rotation |
+| `--cold-latency-ms <ms>` | `viz-repl`, `scenario` (tiered), `compare` | 50 | Artificial latency for cold segment reads |
