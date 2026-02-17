@@ -21,45 +21,6 @@ use viz::tracer::JsonTracer;
 
 mod scenario;
 
-struct LearnModule {
-    number: u8,
-    title: &'static str,
-    goal: &'static str,
-    scenario_file: &'static str,
-    recommended_preset: &'static str,
-}
-
-const LEARN_MODULES: [LearnModule; 4] = [
-    LearnModule {
-        number: 1,
-        title: "WAL Basics",
-        goal: "Single-node writes, refresh, and read-back from the log-backed page store.",
-        scenario_file: "scenarios/01_wal_basics.toml",
-        recommended_preset: "base",
-    },
-    LearnModule {
-        number: 2,
-        title: "Read Isolation",
-        goal: "Two compute nodes with independent read points (stale read then refresh).",
-        scenario_file: "scenarios/02_read_isolation.toml",
-        recommended_preset: "base",
-    },
-    LearnModule {
-        number: 3,
-        title: "Materialization & Cache",
-        goal: "Observe first-read materialization and second-read cache hits across pages.",
-        scenario_file: "scenarios/03_materialization_cache.toml",
-        recommended_preset: "base",
-    },
-    LearnModule {
-        number: 4,
-        title: "Tiered WAL",
-        goal: "Segment rotation and cross-node reads with hot/cold WAL tiers.",
-        scenario_file: "scenarios/04_tiered_wal.toml",
-        recommended_preset: "tiered",
-    },
-];
-
 // ---------------------------------------------------------------------------
 // Viz REPL types
 // ---------------------------------------------------------------------------
@@ -159,16 +120,6 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         "demo" => run_demo().await?,
         "repl" => run_repl().await?,
-        "learn" => {
-            run_learn_cli(
-                &args,
-                trace_json_path.as_deref(),
-                &preset,
-                segment_size,
-                cold_latency_ms,
-            )
-            .await?
-        }
         "viz-demo" => run_viz_demo(delay_ms, !no_color).await?,
         "viz-repl" => {
             run_viz_repl(
@@ -208,10 +159,9 @@ async fn main() -> anyhow::Result<()> {
             scenario::run_scenario_compare(&scenario_path, segment_size, cold_latency_ms).await?;
         }
         _ => {
-            eprintln!("Usage: mini-aurora [demo|repl|learn|viz-demo|viz-repl|scenario|compare] [--delay <ms>] [--no-color]");
+            eprintln!("Usage: mini-aurora [demo|repl|viz-demo|viz-repl|scenario|compare] [--delay <ms>] [--no-color]");
             eprintln!("       [--preset base|tiered] [--trace-json path]");
             eprintln!("       [--segment-size <bytes>] [--cold-latency-ms <ms>]");
-            eprintln!("       mini-aurora learn [path|run <1|2|3|4|all>]");
             eprintln!("       mini-aurora scenario <file.toml> [flags...]");
             eprintln!("       mini-aurora scenario --list");
             eprintln!("       mini-aurora compare <file.toml> [flags...]");
@@ -236,108 +186,12 @@ fn parse_flag_string(args: &[String], flag: &str) -> Option<String> {
         .map(|v| v.clone())
 }
 
-fn print_learning_path() {
-    println!("=== Mini-Aurora Learning Path ===");
-    println!("Run modules in order. Each module maps to one scenario and one Aurora concept.\n");
-    for m in &LEARN_MODULES {
-        println!("{}. {} [{}]", m.number, m.title, m.recommended_preset);
-        println!("   Goal: {}", m.goal);
-        println!("   Run:  cargo run -- learn run {}", m.number);
-        if m.recommended_preset == "tiered" {
-            println!(
-                "         cargo run -- learn run {} --preset tiered",
-                m.number
-            );
-        }
-    }
-    println!("\nRun all modules: cargo run -- learn run all");
-    println!("List scenarios:  cargo run -- scenario --list");
-}
-
 fn print_scenario_catalog() {
     println!("=== Scenarios ===");
-    println!("Progressive modules:");
-    for m in &LEARN_MODULES {
-        println!("  {}. {:<22} {}", m.number, m.scenario_file, m.goal);
-    }
-    println!("\nAdvanced workloads:");
     println!("  scenarios/burst.toml               Burst writes and repeated reads");
     println!("  scenarios/cold_reads.toml          Cache miss/hit pattern across pages");
     println!("  scenarios/noisy_neighbor.toml      Stale-reader behavior under write churn");
     println!("  scenarios/tiered_demo.toml         Segment rotation with tiered storage");
-}
-
-async fn run_learn_cli(
-    args: &[String],
-    trace_json: Option<&str>,
-    preset: &str,
-    segment_size: u64,
-    cold_latency_ms: u64,
-) -> anyhow::Result<()> {
-    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("path");
-    match sub {
-        "path" | "list" => {
-            print_learning_path();
-            Ok(())
-        }
-        "run" => {
-            let target = args.get(3).map(|s| s.as_str()).unwrap_or("1");
-            if target == "all" {
-                for module in &LEARN_MODULES {
-                    let selected_preset = if preset == "base" {
-                        module.recommended_preset
-                    } else {
-                        preset
-                    };
-                    println!(
-                        "\n=== Learn {}: {} (preset: {}) ===",
-                        module.number, module.title, selected_preset
-                    );
-                    scenario::run_scenario_cli(
-                        module.scenario_file,
-                        selected_preset,
-                        trace_json,
-                        segment_size,
-                        cold_latency_ms,
-                    )
-                    .await?;
-                }
-                return Ok(());
-            }
-
-            let module_num: u8 = target.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid module '{target}'. Use 1, 2, 3, 4, or all.")
-            })?;
-            let module = LEARN_MODULES
-                .iter()
-                .find(|m| m.number == module_num)
-                .ok_or_else(|| anyhow::anyhow!("Unknown module {module_num}. Use 1..4."))?;
-
-            let selected_preset = if preset == "base" {
-                module.recommended_preset
-            } else {
-                preset
-            };
-
-            println!(
-                "=== Learn {}: {} (preset: {}) ===",
-                module.number, module.title, selected_preset
-            );
-            println!("Goal: {}\n", module.goal);
-            scenario::run_scenario_cli(
-                module.scenario_file,
-                selected_preset,
-                trace_json,
-                segment_size,
-                cold_latency_ms,
-            )
-            .await
-        }
-        _ => {
-            eprintln!("Usage: mini-aurora learn [path|run <1|2|3|4|all>]");
-            std::process::exit(1);
-        }
-    }
 }
 
 async fn run_demo() -> anyhow::Result<()> {

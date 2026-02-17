@@ -47,26 +47,6 @@ Aurora's key insight is that the write-ahead log (WAL) _is_ the database — pag
 
 ## Quick Start
 
-Use the built-in learning path first. It is intentionally progressive.
-
-```bash
-# Show the module path
-cargo run -- learn
-
-# Run modules one-by-one
-cargo run -- learn run 1
-cargo run -- learn run 2
-cargo run -- learn run 3
-
-# Module 4 is tiered WAL (recommended preset: tiered)
-cargo run -- learn run 4 --preset tiered
-
-# Or run everything in sequence
-cargo run -- learn run all
-```
-
-After the learning path, use these modes for deeper exploration:
-
 ```bash
 # Scripted and interactive basics
 cargo run -- demo
@@ -160,10 +140,6 @@ cargo run -- scenario --list
 
 | File | What it tests |
 |------|---------------|
-| `scenarios/01_wal_basics.toml` | Single-node WAL write/read flow |
-| `scenarios/02_read_isolation.toml` | Stale read then refresh across nodes |
-| `scenarios/03_materialization_cache.toml` | Materialization on first read, cache hits on second read |
-| `scenarios/04_tiered_wal.toml` | Tiered WAL segment rotation and cross-node reads |
 | `scenarios/burst.toml` | 50 rapid writes then reads — WAL throughput and cache churn |
 | `scenarios/cold_reads.toml` | Repeated reads across a mixed page set — cache miss/hit behavior |
 | `scenarios/noisy_neighbor.toml` | Node A does heavy writes while Node B reads with a stale read point |
