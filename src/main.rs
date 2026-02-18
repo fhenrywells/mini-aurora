@@ -158,6 +158,13 @@ async fn main() -> anyhow::Result<()> {
             });
             scenario::run_scenario_compare(&scenario_path, segment_size, cold_latency_ms).await?;
         }
+        "crash-writer" => {
+            let wal_path = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: mini-aurora crash-writer <wal-path>");
+                std::process::exit(1);
+            });
+            run_crash_writer(&wal_path).await?;
+        }
         _ => {
             eprintln!("Usage: mini-aurora [demo|repl|viz-demo|viz-repl|scenario|compare] [--delay <ms>] [--no-color]");
             eprintln!("       [--preset base|tiered] [--trace-json path]");
@@ -192,6 +199,42 @@ fn print_scenario_catalog() {
     println!("  scenarios/cold_reads.toml          Cache miss/hit pattern across pages");
     println!("  scenarios/noisy_neighbor.toml      Stale-reader behavior under write churn");
     println!("  scenarios/tiered_demo.toml         Segment rotation with tiered storage");
+}
+
+/// Write pages in a tight loop to a WAL file, printing "VDL={n}" after each durable commit.
+///
+/// Designed to be spawned by the crash-recovery integration test:
+///   1. Test spawns this process and reads its stdout.
+///   2. When "VDL=N" is seen, N pages are durably committed.
+///   3. Test sends SIGTERM; this process dies immediately (no signal handler).
+///   4. Test reopens the WAL and verifies recovery.
+///
+/// If the WAL already exists (e.g. after a crash), recovery runs automatically on open
+/// and writing resumes from the next LSN.
+async fn run_crash_writer(wal_path: &str) -> anyhow::Result<()> {
+    use std::io::Write as IoWrite;
+
+    let path = PathBuf::from(wal_path);
+    let storage = Arc::new(StorageEngine::open(&path)?);
+    let compute = ComputeEngine::new(storage.clone(), 256);
+    compute.refresh_read_point().await?;
+
+    let state = storage.get_durability_state().await?;
+    if state.vdl > 0 {
+        eprintln!("[crash-writer] Recovered: VDL={}", state.vdl);
+    }
+
+    // Start page IDs after whatever was already durably written.
+    let mut page_id: PageId = state.vdl + 1;
+
+    loop {
+        let data = format!("page-{page_id}").into_bytes();
+        let vdl = compute.put(page_id, 0, data).await?;
+        println!("VDL={vdl}");
+        io::stdout().flush().ok();
+        page_id += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn run_demo() -> anyhow::Result<()> {

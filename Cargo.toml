@@ -46,3 +46,7 @@ anyhow = "1"
 [[test]]
 name = "phase1_tests"
 path = "tests/phase1_tests.rs"
+
+[[test]]
+name = "crash_recovery"
+path = "tests/crash_recovery.rs"

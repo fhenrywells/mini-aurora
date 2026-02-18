@@ -289,13 +289,54 @@ Run the included tiered scenario to see segment rotation in action:
 cargo run -- scenario scenarios/tiered_demo.toml --preset tiered --trace-json /tmp/tiered.json
 ```
 
+## Crash Recovery
+
+Aurora's durability guarantee is that anything at LSN ≤ VDL survives any crash. On every
+`StorageEngine::open()`, a five-phase recovery runs automatically:
+
+1. Forward-scan WAL, validate CRC32 on each record
+2. Compute VCL — highest LSN N where all records 1..=N are present (no gaps)
+3. Compute VDL — highest MTR-complete (CPL) LSN ≤ VCL
+4. Truncate WAL at VDL — discard any incomplete mini-transaction
+5. Rebuild `page_index` and `lsn_offsets` from the surviving records
+
+Because pages are never written to disk — only redo records are — recovery never needs to
+replay full page images. You get back to a consistent state by re-materializing on the next
+read.
+
+### Crash demo
+
+The `crash-writer` subcommand writes pages in a tight loop and prints `VDL={n}` after each
+durable commit. Kill it at any point and restart to see recovery in action:
+
+```bash
+# Terminal 1 — start writing
+cargo run -- crash-writer /tmp/demo.wal
+
+# Terminal 2 — crash it mid-stream
+kill -TERM $(pgrep -f "crash-writer")
+
+# Restart — prints "Recovered: VDL=N", then resumes from N+1
+cargo run -- crash-writer /tmp/demo.wal
+```
+
+### Crash recovery test
+
+An end-to-end integration test (`tests/crash_recovery.rs`) spawns `crash-writer` as a
+subprocess, waits for 5 durable pages, sends `SIGTERM`, reopens the WAL, and asserts that
+all 5 pages are correctly materializable after recovery:
+
+```bash
+cargo test --test crash_recovery -- --nocapture
+```
+
 ## Tests
 
 ```bash
 cargo test --workspace
 ```
 
-63 tests covering WAL read/write, crash recovery, segmented WAL, page materialization, cache behavior, compute transactions, storage engine integration, versioned reads, and multi-page atomicity.
+64 tests covering WAL read/write, crash recovery, segmented WAL, page materialization, cache behavior, compute transactions, storage engine integration, versioned reads, multi-page atomicity, and end-to-end SIGTERM crash recovery.
 
 ## Global Flags
 
