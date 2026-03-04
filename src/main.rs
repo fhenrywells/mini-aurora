@@ -841,7 +841,7 @@ async fn run_viz_repl(
     println!("          node A|B, state, metrics, bg <node> write|read|mixed <ms>");
     println!("          bg stop <node>, bg list, viz on|off, delay <ms>, suggest single|sequence");
     println!("          1/2/3 (run suggestion), quit\n");
-    println!("Tip: type `suggest` to view mode, or `suggest sequence` to toggle.\n");
+    println!("Tip: type `suggest sequence` to switch to sequence mode.\n");
 
     let config = VizConfig {
         step_delay: Duration::from_millis(delay_ms),
@@ -1294,11 +1294,14 @@ async fn run_viz_repl(
                     }
                     "suggest" => {
                         if parts.len() < 2 {
-                            let mode = match state.suggestion_mode {
-                                SuggestionMode::Single => "single",
-                                SuggestionMode::Sequence => "sequence",
-                            };
-                            println!("Suggestion mode: {mode}");
+                            match state.suggestion_mode {
+                                SuggestionMode::Single => {
+                                    println!("Suggestion mode: single (switch with `suggest sequence`)");
+                                }
+                                SuggestionMode::Sequence => {
+                                    println!("Suggestion mode: sequence (switch with `suggest single`)");
+                                }
+                            }
                         } else {
                             match parts[1] {
                                 "single" => {
@@ -1537,11 +1540,14 @@ fn print_suggestions(state: &ReplState) {
     if state.suggestions.is_empty() {
         return;
     }
-    let mode = match state.suggestion_mode {
-        SuggestionMode::Single => "single",
-        SuggestionMode::Sequence => "sequence",
-    };
-    println!("Suggestions ({mode} mode, toggle with `suggest`):");
+    match state.suggestion_mode {
+        SuggestionMode::Single => {
+            println!("Suggestions (single mode, switch with `suggest sequence`):");
+        }
+        SuggestionMode::Sequence => {
+            println!("Suggestions (sequence mode, switch with `suggest single`):");
+        }
+    }
     let descs = |cmd: &str| -> String {
         if cmd.contains(';') {
             let steps: Vec<String> = cmd
