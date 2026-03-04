@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,10 +9,15 @@ use std::time::Duration;
 use mini_aurora_common::{PageId, StorageApi, PAGE_SIZE};
 use mini_aurora_compute::engine::ComputeEngine;
 use mini_aurora_storage::engine::StorageEngine;
+use mini_aurora_wal::recovery::recover;
 use tokio_util::sync::CancellationToken;
 
+mod utils;
 mod viz;
 
+use utils::repl::{
+    ensure_range_in_page, parse_len, parse_offset, parse_page_id, print_page_raw, print_page_text,
+};
 use viz::compute::VizComputeEngine;
 use viz::engine::VizStorageEngine;
 use viz::events::VizConfig;
@@ -34,6 +39,23 @@ struct ReplState {
     renderer: Arc<Mutex<VizRenderer>>,
     bg_page_counter: Arc<AtomicU64>,
     bg_output_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    storage_mode: VizStorageMode,
+    suggestion_mode: SuggestionMode,
+}
+
+enum VizStorageMode {
+    Base { wal_path: PathBuf },
+    Tiered {
+        base_dir: PathBuf,
+        segment_size: u64,
+        cold_latency_ms: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuggestionMode {
+    Single,
+    Sequence,
 }
 
 /// RAII guard: suppresses viz rendering while held, restores on drop.
@@ -193,6 +215,25 @@ fn parse_flag_string(args: &[String], flag: &str) -> Option<String> {
         .map(|v| v.clone())
 }
 
+fn next_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
+fn random_ascii(seed: &mut u64, len: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut s = String::with_capacity(len);
+    for _ in 0..len {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let idx = (*seed % ALPHABET.len() as u64) as usize;
+        s.push(ALPHABET[idx] as char);
+    }
+    s
+}
+
 fn print_scenario_catalog() {
     println!("=== Scenarios ===");
     println!("  scenarios/burst.toml               Burst writes and repeated reads");
@@ -298,11 +339,14 @@ async fn run_demo() -> anyhow::Result<()> {
 
 async fn run_repl() -> anyhow::Result<()> {
     println!("=== Mini-Aurora REPL ===");
-    println!("Commands: put <page> <offset> <text>, get <page>, state, quit\n");
+    println!(
+        "Commands: put <page> <offset> <text>, put-random <count>, get <page>, get-raw <page>, del <page> <offset> <len>"
+    );
+    println!("          clear-page <page>, compact, state, clear, quit\n");
 
     let wal_path = PathBuf::from("/tmp/mini-aurora-repl.wal");
-    let storage = Arc::new(StorageEngine::open(&wal_path)?);
-    let compute = ComputeEngine::new(storage.clone(), 256);
+    let mut storage = Arc::new(StorageEngine::open(&wal_path)?);
+    let mut compute = ComputeEngine::new(storage.clone(), 256);
 
     // Refresh read point from any prior session
     compute.refresh_read_point().await?;
@@ -310,7 +354,7 @@ async fn run_repl() -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
-    loop {
+    'repl: loop {
         print!("aurora> ");
         stdout.flush()?;
 
@@ -318,28 +362,40 @@ async fn run_repl() -> anyhow::Result<()> {
         if stdin.read_line(&mut line)? == 0 {
             break;
         }
-        let parts: Vec<&str> = line.trim().splitn(4, ' ').collect();
-        if parts.is_empty() || parts[0].is_empty() {
+        let commands: Vec<String> = line
+            .trim()
+            .split(';')
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+            .map(|cmd| cmd.to_string())
+            .collect();
+        if commands.is_empty() {
             continue;
         }
 
-        match parts[0] {
+        for command in commands {
+            let parts: Vec<&str> = command.splitn(4, ' ').collect();
+            if parts.is_empty() || parts[0].is_empty() {
+                continue;
+            }
+
+            match parts[0] {
             "put" => {
                 if parts.len() < 4 {
                     println!("Usage: put <page_id> <offset> <text>");
                     continue;
                 }
-                let page_id: PageId = match parts[1].parse() {
+                let page_id = match parse_page_id(parts[1]) {
                     Ok(v) => v,
-                    Err(_) => {
-                        println!("Invalid page_id");
+                    Err(msg) => {
+                        println!("{msg}");
                         continue;
                     }
                 };
-                let offset: u16 = match parts[2].parse() {
+                let offset = match parse_offset(parts[2]) {
                     Ok(v) => v,
-                    Err(_) => {
-                        println!("Invalid offset");
+                    Err(msg) => {
+                        println!("{msg}");
                         continue;
                     }
                 };
@@ -349,27 +405,133 @@ async fn run_repl() -> anyhow::Result<()> {
                     Err(e) => println!("Error: {e}"),
                 }
             }
+            "put-random" => {
+                if parts.len() < 2 {
+                    println!("Usage: put-random <count>");
+                    continue;
+                }
+                let count: u64 = match parts[1].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        println!("Invalid count");
+                        continue;
+                    }
+                };
+                if count == 0 {
+                    println!("Nothing written (count=0)");
+                    continue;
+                }
+                let recovery = match recover(&wal_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        println!("Error reading WAL state: {e}");
+                        continue;
+                    }
+                };
+                let start_page = recovery.page_index.keys().copied().max().unwrap_or(0) + 1;
+                let mut seed = next_seed();
+                let mut last_vdl = 0;
+                for i in 0..count {
+                    let page_id = start_page + i;
+                    let payload = random_ascii(&mut seed, 12).into_bytes();
+                    match compute.put(page_id, 0, payload).await {
+                        Ok(vdl) => last_vdl = vdl,
+                        Err(e) => {
+                            println!("Error on page {page_id}: {e}");
+                            break;
+                        }
+                    }
+                }
+                let end_page = start_page + count - 1;
+                println!(
+                    "OK (inserted {count} random string(s), pages {start_page}..{end_page}, VDL={last_vdl})"
+                );
+            }
             "get" => {
                 if parts.len() < 2 {
                     println!("Usage: get <page_id>");
                     continue;
                 }
-                let page_id: PageId = match parts[1].parse() {
+                let page_id = match parse_page_id(parts[1]) {
                     Ok(v) => v,
-                    Err(_) => {
-                        println!("Invalid page_id");
+                    Err(msg) => {
+                        println!("{msg}");
                         continue;
                     }
                 };
                 match compute.get(page_id).await {
-                    Ok(page) => {
-                        let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
-                        if end == 0 {
-                            println!("(empty page)");
-                        } else {
-                            println!("{:?}", String::from_utf8_lossy(&page[..end]));
-                        }
+                    Ok(page) => print_page_text(&page),
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+            "get-raw" => {
+                if parts.len() < 2 {
+                    println!("Usage: get-raw <page_id>");
+                    continue;
+                }
+                let page_id = match parse_page_id(parts[1]) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        println!("{msg}");
+                        continue;
                     }
+                };
+                match compute.get(page_id).await {
+                    Ok(page) => print_page_raw(&page),
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+            "del" => {
+                if parts.len() < 4 {
+                    println!("Usage: del <page_id> <offset> <len>");
+                    continue;
+                }
+                let page_id = match parse_page_id(parts[1]) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        println!("{msg}");
+                        continue;
+                    }
+                };
+                let offset = match parse_offset(parts[2]) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        println!("{msg}");
+                        continue;
+                    }
+                };
+                let len = match parse_len(parts[3]) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        println!("{msg}");
+                        continue;
+                    }
+                };
+                if let Err(msg) = ensure_range_in_page(offset, len) {
+                    println!("{msg}");
+                    continue;
+                }
+                let zeros = vec![0u8; len];
+                match compute.put(page_id, offset, zeros).await {
+                    Ok(vdl) => println!("OK (deleted {len} byte(s), VDL={vdl})"),
+                    Err(e) => println!("Error: {e}"),
+                }
+            }
+            "clear-page" => {
+                if parts.len() < 2 {
+                    println!("Usage: clear-page <page_id>");
+                    continue;
+                }
+                let page_id = match parse_page_id(parts[1]) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        println!("{msg}");
+                        continue;
+                    }
+                };
+                let zeros = vec![0u8; PAGE_SIZE];
+                match compute.put(page_id, 0, zeros).await {
+                    Ok(vdl) => println!("OK (page {page_id} cleared, VDL={vdl})"),
                     Err(e) => println!("Error: {e}"),
                 }
             }
@@ -377,12 +539,220 @@ async fn run_repl() -> anyhow::Result<()> {
                 Ok(s) => println!("{s}"),
                 Err(e) => println!("Error: {e}"),
             },
-            "quit" | "exit" | "q" => break,
+            "clear" => {
+                match std::fs::remove_file(&wal_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        println!("Error clearing WAL file: {e}");
+                        continue;
+                    }
+                }
+
+                storage = Arc::new(StorageEngine::open(&wal_path)?);
+                compute = ComputeEngine::new(storage.clone(), 256);
+                compute.refresh_read_point().await?;
+                println!("OK (database cleared)");
+            }
+            "compact" => match compact_repl_wal(&wal_path, &mut storage, &mut compute).await {
+                Ok((old_bytes, new_bytes, pages_before, pages_after)) => {
+                    println!(
+                        "OK (compacted: {old_bytes} -> {new_bytes} bytes, pages: {pages_before} -> {pages_after})"
+                    );
+                }
+                Err(e) => println!("Error compacting WAL: {e}"),
+            },
+            "quit" | "exit" | "q" => break 'repl,
             other => println!("Unknown command: {other}"),
+            }
         }
     }
 
     println!("Bye!");
+    Ok(())
+}
+
+async fn compact_repl_wal(
+    wal_path: &Path,
+    storage: &mut Arc<StorageEngine>,
+    compute: &mut ComputeEngine,
+) -> anyhow::Result<(u64, u64, usize, usize)> {
+    let old_bytes = std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0);
+    let recovery = recover(wal_path)?;
+    let page_ids: Vec<PageId> = recovery.page_index.keys().copied().collect();
+    let pages_before = page_ids.len();
+
+    compute.refresh_read_point().await?;
+
+    let mut snapshot = Vec::new();
+    for page_id in &page_ids {
+        let page = compute.get(*page_id).await?;
+        if page.iter().all(|&b| b == 0) {
+            continue;
+        }
+        snapshot.push((*page_id, page.to_vec()));
+    }
+    let pages_after = snapshot.len();
+
+    let _ = std::fs::remove_file(wal_path);
+    *storage = Arc::new(StorageEngine::open(wal_path)?);
+    *compute = ComputeEngine::new(storage.clone(), 256);
+    compute.refresh_read_point().await?;
+
+    for (page_id, bytes) in snapshot {
+        compute.put(page_id, 0, bytes).await?;
+    }
+
+    let new_bytes = std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0);
+    Ok((old_bytes, new_bytes, pages_before, pages_after))
+}
+
+fn open_viz_storage(
+    mode: &VizStorageMode,
+    renderer: Arc<Mutex<VizRenderer>>,
+    reset_on_open: bool,
+) -> anyhow::Result<Arc<VizStorageEngine>> {
+    match mode {
+        VizStorageMode::Base { wal_path } => {
+            if reset_on_open {
+                let _ = std::fs::remove_file(wal_path);
+            }
+            Ok(Arc::new(VizStorageEngine::open(wal_path, renderer)?))
+        }
+        VizStorageMode::Tiered {
+            base_dir,
+            segment_size,
+            cold_latency_ms,
+        } => {
+            if reset_on_open {
+                let _ = std::fs::remove_dir_all(base_dir);
+            }
+            Ok(Arc::new(VizStorageEngine::open_tiered(
+                base_dir,
+                *segment_size,
+                Duration::from_millis(*cold_latency_ms),
+                renderer,
+            )?))
+        }
+    }
+}
+
+fn storage_bytes(mode: &VizStorageMode) -> u64 {
+    match mode {
+        VizStorageMode::Base { wal_path } => std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0),
+        VizStorageMode::Tiered { base_dir, .. } => directory_size_bytes(base_dir),
+    }
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        match entry.metadata() {
+            Ok(meta) if meta.is_file() => total += meta.len(),
+            Ok(meta) if meta.is_dir() => total += directory_size_bytes(&entry_path),
+            _ => {}
+        }
+    }
+    total
+}
+
+async fn compact_viz_repl_storage(
+    state: &mut ReplState,
+) -> anyhow::Result<(u64, u64, usize, usize)> {
+    if !state.workers.is_empty() {
+        anyhow::bail!("stop background workers before compacting (use `bg stop A` / `bg stop B`)");
+    }
+
+    let _guard = VizGuard::suppress(&state.renderer);
+    let old_bytes = storage_bytes(&state.storage_mode);
+    let page_ids = state.storage.durable_page_ids();
+    let pages_before = page_ids.len();
+
+    let current = state
+        .nodes
+        .get(&state.current_node)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("current node {} is unavailable", state.current_node))?;
+    current.refresh_read_point().await?;
+
+    let mut snapshot = Vec::new();
+    for page_id in &page_ids {
+        let page = current.get(*page_id).await?;
+        if page.iter().all(|&b| b == 0) {
+            continue;
+        }
+        snapshot.push((*page_id, page.to_vec()));
+    }
+    let pages_after = snapshot.len();
+
+    let storage = open_viz_storage(&state.storage_mode, state.renderer.clone(), true)?;
+    let node_a = Arc::new(VizComputeEngine::new(
+        storage.clone(),
+        256,
+        state.renderer.clone(),
+        "A".to_string(),
+    ));
+    let node_b = Arc::new(VizComputeEngine::new(
+        storage.clone(),
+        256,
+        state.renderer.clone(),
+        "B".to_string(),
+    ));
+    node_a.refresh_read_point().await?;
+    node_b.refresh_read_point().await?;
+
+    for (page_id, bytes) in snapshot {
+        node_a.put(page_id, 0, bytes).await?;
+    }
+
+    let mut nodes = HashMap::new();
+    nodes.insert("A".to_string(), node_a);
+    nodes.insert("B".to_string(), node_b);
+    state.storage = storage;
+    state.nodes = nodes;
+    if !state.nodes.contains_key(&state.current_node) {
+        state.current_node = "A".to_string();
+    }
+
+    let new_bytes = storage_bytes(&state.storage_mode);
+    Ok((old_bytes, new_bytes, pages_before, pages_after))
+}
+
+async fn clear_viz_repl_storage(state: &mut ReplState) -> anyhow::Result<()> {
+    if !state.workers.is_empty() {
+        anyhow::bail!("stop background workers before clearing (use `bg stop A` / `bg stop B`)");
+    }
+
+    let _guard = VizGuard::suppress(&state.renderer);
+    let storage = open_viz_storage(&state.storage_mode, state.renderer.clone(), true)?;
+    let node_a = Arc::new(VizComputeEngine::new(
+        storage.clone(),
+        256,
+        state.renderer.clone(),
+        "A".to_string(),
+    ));
+    let node_b = Arc::new(VizComputeEngine::new(
+        storage.clone(),
+        256,
+        state.renderer.clone(),
+        "B".to_string(),
+    ));
+    node_a.refresh_read_point().await?;
+    node_b.refresh_read_point().await?;
+
+    let mut nodes = HashMap::new();
+    nodes.insert("A".to_string(), node_a);
+    nodes.insert("B".to_string(), node_b);
+    state.storage = storage;
+    state.nodes = nodes;
+    if !state.nodes.contains_key(&state.current_node) {
+        state.current_node = "A".to_string();
+    }
     Ok(())
 }
 
@@ -466,10 +836,12 @@ async fn run_viz_repl(
     cold_latency_ms: u64,
 ) -> anyhow::Result<()> {
     println!("=== Mini-Aurora Viz REPL (preset: {preset}) ===");
-    println!("Commands: put <page> <offset> <text>, get <page>, refresh");
+    println!("Commands: put <page> <offset> <text>, put-random <count>, get <page>, get-raw <page>");
+    println!("          del <page> <offset> <len>, clear-page <page>, compact, clear, refresh");
     println!("          node A|B, state, metrics, bg <node> write|read|mixed <ms>");
-    println!("          bg stop <node>, bg list, viz on|off, delay <ms>");
+    println!("          bg stop <node>, bg list, viz on|off, delay <ms>, suggest single|sequence");
     println!("          1/2/3 (run suggestion), quit\n");
+    println!("Tip: type `suggest` to view mode, or `suggest sequence` to toggle.\n");
 
     let config = VizConfig {
         step_delay: Duration::from_millis(delay_ms),
@@ -484,26 +856,23 @@ async fn run_viz_repl(
     }
     let renderer = Arc::new(Mutex::new(renderer_inner));
 
-    let storage: Arc<VizStorageEngine> = match preset {
+    let storage_mode = match preset {
         "tiered" => {
-            let base_dir = PathBuf::from("/tmp/mini-aurora-viz-tiered");
-            let _ = std::fs::remove_dir_all(&base_dir);
-            let cold_latency = Duration::from_millis(cold_latency_ms);
             println!(
                 "Tiered storage: segment_size={segment_size}B, cold_latency={cold_latency_ms}ms"
             );
-            Arc::new(VizStorageEngine::open_tiered(
-                &base_dir,
+            VizStorageMode::Tiered {
+                base_dir: PathBuf::from("/tmp/mini-aurora-viz-tiered"),
                 segment_size,
-                cold_latency,
-                renderer.clone(),
-            )?)
+                cold_latency_ms,
+            }
         }
-        _ => {
-            let wal_path = PathBuf::from("/tmp/mini-aurora-viz-repl.wal");
-            Arc::new(VizStorageEngine::open(&wal_path, renderer.clone())?)
-        }
+        _ => VizStorageMode::Base {
+            wal_path: PathBuf::from("/tmp/mini-aurora-viz-repl.wal"),
+        },
     };
+    let reset_on_open = matches!(&storage_mode, VizStorageMode::Tiered { .. });
+    let storage = open_viz_storage(&storage_mode, renderer.clone(), reset_on_open)?;
 
     let node_a = Arc::new(VizComputeEngine::new(
         storage.clone(),
@@ -536,6 +905,8 @@ async fn run_viz_repl(
         renderer,
         bg_page_counter: Arc::new(AtomicU64::new(100)),
         bg_output_tx,
+        storage_mode,
+        suggestion_mode: SuggestionMode::Single,
     };
 
     // --- Async stdin: OS thread + mpsc channel ---
@@ -563,7 +934,8 @@ async fn run_viz_repl(
         }
     });
 
-    // Print initial suggestions
+    // Print initial suggestions (single mode by default)
+    update_suggestions(&mut state, &CommandOutcome::None, "").await;
     print_suggestions(&state);
 
     // --- Main loop: select on stdin + bg output ---
@@ -588,36 +960,55 @@ async fn run_viz_repl(
                 }
 
                 // Check for suggestion shortcut (1, 2, 3)
-                let cmd = if let Ok(n) = trimmed.parse::<usize>() {
+                let (cmd, from_suggestion) = if let Ok(n) = trimmed.parse::<usize>() {
                     if n >= 1 && n <= state.suggestions.len() {
                         let resolved = state.suggestions[n - 1].clone();
-                        println!(">>> {resolved}");
-                        resolved
+                        (resolved, true)
                     } else {
-                        trimmed
+                        (trimmed, false)
                     }
                 } else {
-                    trimmed
+                    (trimmed, false)
                 };
+                if from_suggestion {
+                    println!(">>> suggested: {cmd}");
+                } else {
+                    println!(">>> input: {cmd}");
+                }
 
-                let parts: Vec<&str> = cmd.splitn(5, ' ').collect();
-                if parts.is_empty() || parts[0].is_empty() {
+                let commands: Vec<String> = cmd
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.to_string())
+                    .collect();
+                if commands.is_empty() {
                     continue;
                 }
 
-                let outcome = match parts[0] {
+                let mut outcome = CommandOutcome::None;
+                let mut should_quit = false;
+                let mut last_executed = String::new();
+                for command in commands {
+                    let parts: Vec<&str> = command.splitn(5, ' ').collect();
+                    if parts.is_empty() || parts[0].is_empty() {
+                        continue;
+                    }
+                    last_executed = command.clone();
+
+                    outcome = match parts[0] {
                     "put" => {
                         if parts.len() < 4 {
                             println!("Usage: put <page_id> <offset> <text>");
                             CommandOutcome::None
                         } else {
-                            let page_id: PageId = match parts[1].parse() {
+                            let page_id = match parse_page_id(parts[1]) {
                                 Ok(v) => v,
-                                Err(_) => { println!("Invalid page_id"); continue; }
+                                Err(msg) => { println!("{msg}"); continue; }
                             };
-                            let offset: u16 = match parts[2].parse() {
+                            let offset = match parse_offset(parts[2]) {
                                 Ok(v) => v,
-                                Err(_) => { println!("Invalid offset"); continue; }
+                                Err(msg) => { println!("{msg}"); continue; }
                             };
                             let data = parts[3].as_bytes().to_vec();
                             if let Some(w) = state.workers.get(&state.current_node) {
@@ -636,14 +1027,68 @@ async fn run_viz_repl(
                             }
                         }
                     }
+                    "put-random" => {
+                        if parts.len() < 2 {
+                            println!("Usage: put-random <count>");
+                            CommandOutcome::None
+                        } else {
+                            let count: u64 = match parts[1].parse() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    println!("Invalid count");
+                                    continue;
+                                }
+                            };
+                            if count == 0 {
+                                println!("Nothing written (count=0)");
+                                CommandOutcome::None
+                            } else {
+                                if let Some(w) = state.workers.get(&state.current_node) {
+                                    println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
+                                }
+                                let start_page = state
+                                    .storage
+                                    .durable_page_ids()
+                                    .into_iter()
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1;
+                                let compute = state.nodes[&state.current_node].clone();
+                                let mut seed = next_seed();
+                                let mut last_vdl = 0;
+                                let mut failed = false;
+                                for i in 0..count {
+                                    let page_id = start_page + i;
+                                    let payload = random_ascii(&mut seed, 12).into_bytes();
+                                    match compute.put(page_id, 0, payload).await {
+                                        Ok(vdl) => last_vdl = vdl,
+                                        Err(e) => {
+                                            println!("Error on page {page_id}: {e}");
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if failed {
+                                    CommandOutcome::None
+                                } else {
+                                let end_page = start_page + count - 1;
+                                println!(
+                                    "OK (inserted {count} random string(s), pages {start_page}..{end_page}, VDL={last_vdl})"
+                                );
+                                CommandOutcome::Put { page_id: end_page }
+                                }
+                            }
+                        }
+                    }
                     "get" => {
                         if parts.len() < 2 {
                             println!("Usage: get <page_id>");
                             CommandOutcome::None
                         } else {
-                            let page_id: PageId = match parts[1].parse() {
+                            let page_id = match parse_page_id(parts[1]) {
                                 Ok(v) => v,
-                                Err(_) => { println!("Invalid page_id"); continue; }
+                                Err(msg) => { println!("{msg}"); continue; }
                             };
                             if let Some(w) = state.workers.get(&state.current_node) {
                                 println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
@@ -651,12 +1096,7 @@ async fn run_viz_repl(
                             let compute = state.nodes[&state.current_node].clone();
                             match compute.get(page_id).await {
                                 Ok(page) => {
-                                    let end = page.iter().position(|&b| b == 0).unwrap_or(PAGE_SIZE);
-                                    if end == 0 {
-                                        println!("(empty page)");
-                                    } else {
-                                        println!("{:?}", String::from_utf8_lossy(&page[..end]));
-                                    }
+                                    print_page_text(&page);
                                     CommandOutcome::GetSuccess { page_id }
                                 }
                                 Err(e) => {
@@ -665,6 +1105,109 @@ async fn run_viz_repl(
                                 }
                             }
                         }
+                    }
+                    "get-raw" => {
+                        if parts.len() < 2 {
+                            println!("Usage: get-raw <page_id>");
+                            CommandOutcome::None
+                        } else {
+                            let page_id = match parse_page_id(parts[1]) {
+                                Ok(v) => v,
+                                Err(msg) => { println!("{msg}"); continue; }
+                            };
+                            if let Some(w) = state.workers.get(&state.current_node) {
+                                println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
+                            }
+                            let compute = state.nodes[&state.current_node].clone();
+                            match compute.get(page_id).await {
+                                Ok(page) => print_page_raw(&page),
+                                Err(e) => println!("Error: {e}"),
+                            }
+                            CommandOutcome::None
+                        }
+                    }
+                    "del" => {
+                        if parts.len() < 4 {
+                            println!("Usage: del <page_id> <offset> <len>");
+                            CommandOutcome::None
+                        } else {
+                            let page_id = match parse_page_id(parts[1]) {
+                                Ok(v) => v,
+                                Err(msg) => { println!("{msg}"); continue; }
+                            };
+                            let offset = match parse_offset(parts[2]) {
+                                Ok(v) => v,
+                                Err(msg) => { println!("{msg}"); continue; }
+                            };
+                            let len = match parse_len(parts[3]) {
+                                Ok(v) => v,
+                                Err(msg) => { println!("{msg}"); continue; }
+                            };
+                            if let Err(msg) = ensure_range_in_page(offset, len) {
+                                println!("{msg}");
+                                CommandOutcome::None
+                            } else {
+                                if let Some(w) = state.workers.get(&state.current_node) {
+                                    println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
+                                }
+                                let compute = state.nodes[&state.current_node].clone();
+                                let zeros = vec![0u8; len];
+                                match compute.put(page_id, offset, zeros).await {
+                                    Ok(vdl) => {
+                                        println!("OK (deleted {len} byte(s), VDL={vdl})");
+                                        CommandOutcome::Put { page_id }
+                                    }
+                                    Err(e) => {
+                                        println!("Error: {e}");
+                                        CommandOutcome::None
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "clear-page" => {
+                        if parts.len() < 2 {
+                            println!("Usage: clear-page <page_id>");
+                            CommandOutcome::None
+                        } else {
+                            let page_id = match parse_page_id(parts[1]) {
+                                Ok(v) => v,
+                                Err(msg) => { println!("{msg}"); continue; }
+                            };
+                            if let Some(w) = state.workers.get(&state.current_node) {
+                                println!("(warning: node {} has active bg {} worker)", state.current_node, w.kind);
+                            }
+                            let compute = state.nodes[&state.current_node].clone();
+                            let zeros = vec![0u8; PAGE_SIZE];
+                            match compute.put(page_id, 0, zeros).await {
+                                Ok(vdl) => {
+                                    println!("OK (page {page_id} cleared, VDL={vdl})");
+                                    CommandOutcome::Put { page_id }
+                                }
+                                Err(e) => {
+                                    println!("Error: {e}");
+                                    CommandOutcome::None
+                                }
+                            }
+                        }
+                    }
+                    "compact" => {
+                        match compact_viz_repl_storage(&mut state).await {
+                            Ok((old_bytes, new_bytes, pages_before, pages_after)) => {
+                                println!(
+                                    "OK (compacted: {old_bytes} -> {new_bytes} bytes, pages: {pages_before} -> {pages_after})"
+                                );
+                            }
+                            Err(e) => println!("Error compacting storage: {e}"),
+                        }
+                        CommandOutcome::None
+                    }
+                    "clear" => {
+                        match clear_viz_repl_storage(&mut state).await {
+                            Ok(()) => println!("OK (database cleared)"),
+                            Err(e) => println!("Error clearing storage: {e}"),
+                        }
+                        CommandOutcome::None
                     }
                     "refresh" => {
                         let compute = state.nodes[&state.current_node].clone();
@@ -749,13 +1292,36 @@ async fn run_viz_repl(
                         }
                         CommandOutcome::None
                     }
+                    "suggest" => {
+                        if parts.len() < 2 {
+                            let mode = match state.suggestion_mode {
+                                SuggestionMode::Single => "single",
+                                SuggestionMode::Sequence => "sequence",
+                            };
+                            println!("Suggestion mode: {mode}");
+                        } else {
+                            match parts[1] {
+                                "single" => {
+                                    state.suggestion_mode = SuggestionMode::Single;
+                                    println!("Suggestion mode set to single-command.");
+                                }
+                                "sequence" => {
+                                    state.suggestion_mode = SuggestionMode::Sequence;
+                                    println!("Suggestion mode set to command-sequences.");
+                                }
+                                _ => println!("Usage: suggest single|sequence"),
+                            }
+                        }
+                        CommandOutcome::None
+                    }
                     "quit" | "exit" | "q" => {
                         for (label, handle) in state.workers.drain() {
                             handle.cancel.cancel();
                             let _ = handle.task.await;
                             println!("Stopped bg worker on Node {label}");
                         }
-                        break;
+                        should_quit = true;
+                        CommandOutcome::None
                     }
                     other => {
                         println!("Unknown command: {other}");
@@ -767,8 +1333,15 @@ async fn run_viz_repl(
                 while let Ok(msg) = bg_output_rx.try_recv() {
                     println!("{msg}");
                 }
+                if should_quit {
+                    break;
+                }
+                }
 
-                update_suggestions(&mut state, &outcome);
+                if should_quit {
+                    break;
+                }
+                update_suggestions(&mut state, &outcome, &last_executed).await;
                 print_suggestions(&state);
             }
 
@@ -793,99 +1366,245 @@ fn other_node(current: &str) -> &'static str {
     }
 }
 
-fn update_suggestions(state: &mut ReplState, outcome: &CommandOutcome) {
-    state.suggestions.clear();
-    match outcome {
-        CommandOutcome::Put { page_id } => {
-            state.suggestions.push(format!("get {page_id}"));
-            state.suggestions.push(format!("put {page_id} 0 updated"));
-            state
-                .suggestions
-                .push(format!("node {}", other_node(&state.current_node)));
+async fn update_suggestions(state: &mut ReplState, outcome: &CommandOutcome, last_command: &str) {
+    let mut page_ids = state.storage.durable_page_ids();
+    page_ids.sort_unstable();
+    let sample_page = page_ids.first().copied().unwrap_or(1);
+    let other = other_node(&state.current_node);
+    let workers_running = !state.workers.is_empty();
+    let has_data = !page_ids.is_empty();
+
+    let raw = match state.suggestion_mode {
+        SuggestionMode::Single => {
+            single_command_suggestions(outcome, sample_page, other, workers_running, has_data)
         }
-        CommandOutcome::GetSuccess { page_id } => {
-            state.suggestions.push(format!("put {page_id} 0 new-data"));
-            state.suggestions.push(format!("get {}", page_id + 1));
-            state.suggestions.push("refresh".to_string());
+        SuggestionMode::Sequence => {
+            sequence_suggestions(outcome, sample_page, other, workers_running, has_data)
         }
-        CommandOutcome::GetFailure { page_id } => {
-            state.suggestions.push("refresh".to_string());
-            state.suggestions.push(format!("put {page_id} 0 Hello"));
-            state
-                .suggestions
-                .push(format!("node {}", other_node(&state.current_node)));
-        }
-        CommandOutcome::Refresh => {
-            state.suggestions.push("get 1".to_string());
-            state.suggestions.push("state".to_string());
-            state
-                .suggestions
-                .push(format!("node {}", other_node(&state.current_node)));
-        }
-        CommandOutcome::NodeSwitch => {
-            state.suggestions.push("refresh".to_string());
-            state.suggestions.push("get 1".to_string());
-            state.suggestions.push("state".to_string());
-        }
-        CommandOutcome::BgStarted { node } => {
-            let other = if node == "A" { "B" } else { "A" };
-            state.suggestions.push(format!("bg {other} mixed 500"));
-            state.suggestions.push("bg list".to_string());
-            state.suggestions.push(format!("bg stop {node}"));
-        }
-        CommandOutcome::BgStopped { node: _ } => {
-            state.suggestions.push("bg list".to_string());
-            state.suggestions.push("get 1".to_string());
-            state.suggestions.push("state".to_string());
-        }
+    };
+    let fallback = if state.suggestion_mode == SuggestionMode::Sequence {
+        vec![
+            format!("put {sample_page} 0 Hello; get {sample_page}"),
+            "state; metrics".to_string(),
+            format!("node {other}; refresh; get {sample_page}"),
+        ]
+    } else {
+        vec![
+            format!("put {sample_page} 0 Hello"),
+            format!("get {sample_page}"),
+            "state".to_string(),
+        ]
+    };
+    state.suggestions = normalize_suggestions(raw, fallback, last_command);
+}
+
+fn single_command_suggestions(
+    outcome: &CommandOutcome,
+    sample_page: PageId,
+    other: &str,
+    workers_running: bool,
+    has_data: bool,
+) -> Vec<String> {
+    let mut suggestions = match outcome {
+        CommandOutcome::Put { page_id } => vec![
+            format!("get {page_id}"),
+            format!("del {page_id} 0 1"),
+            "compact".to_string(),
+        ],
+        CommandOutcome::GetSuccess { page_id } => vec![
+            format!("del {page_id} 0 1"),
+            format!("put {page_id} 0 updated"),
+            "compact".to_string(),
+        ],
+        CommandOutcome::GetFailure { page_id } => vec![
+            "refresh".to_string(),
+            format!("put {page_id} 0 Hello"),
+            format!("node {other}"),
+        ],
+        CommandOutcome::Refresh => vec![
+            format!("get {sample_page}"),
+            format!("del {sample_page} 0 1"),
+            "compact".to_string(),
+        ],
+        CommandOutcome::NodeSwitch => vec![
+            "refresh".to_string(),
+            format!("get {sample_page}"),
+            "state".to_string(),
+        ],
+        CommandOutcome::BgStarted { node } => vec![
+            "bg list".to_string(),
+            format!("bg stop {node}"),
+            "state".to_string(),
+        ],
+        CommandOutcome::BgStopped { .. } => vec![
+            "bg list".to_string(),
+            format!("get {sample_page}"),
+            "compact".to_string(),
+        ],
         CommandOutcome::None => {
-            // Keep previous suggestions or show defaults
-            if state.suggestions.is_empty() {
-                state.suggestions.push("put 1 0 Hello".to_string());
+            if workers_running {
+                vec![
+                    "bg list".to_string(),
+                    format!("bg stop {other}"),
+                    "state".to_string(),
+                ]
+            } else {
+                vec![
+                    format!("put {sample_page} 0 Hello"),
+                    "put-random 30".to_string(),
+                    "state".to_string(),
+                ]
             }
         }
+    };
+    if has_data {
+        suggestions.push("clear".to_string());
     }
+    if !workers_running {
+        suggestions.push("put-random 30".to_string());
+    }
+    suggestions
+}
+
+fn sequence_suggestions(
+    outcome: &CommandOutcome,
+    sample_page: PageId,
+    other: &str,
+    workers_running: bool,
+    has_data: bool,
+) -> Vec<String> {
+    let mut suggestions = if workers_running {
+        vec![
+            "bg list; state; metrics".to_string(),
+            "bg stop A; bg stop B; compact".to_string(),
+            format!("node {other}; refresh; get {sample_page}"),
+        ]
+    } else {
+        match outcome {
+            CommandOutcome::GetFailure { page_id } => vec![
+                format!("refresh; get {page_id}; state"),
+                format!("put {page_id} 0 Hello; get {page_id}"),
+                format!("node {other}; refresh; get {page_id}"),
+            ],
+            CommandOutcome::Put { page_id } | CommandOutcome::GetSuccess { page_id } => vec![
+                format!("get {page_id}; del {page_id} 0 1; get-raw {page_id}"),
+                format!("node {other}; refresh; get {page_id}"),
+                "compact; state; metrics".to_string(),
+            ],
+            _ => vec![
+                format!("put {sample_page} 0 Hello; get {sample_page}"),
+                format!("node {other}; refresh; get {sample_page}"),
+                "compact; state; metrics".to_string(),
+            ],
+        }
+    };
+    if has_data {
+        suggestions.push("clear; state; metrics".to_string());
+    }
+    if !workers_running {
+        suggestions.push("put-random 30; state; metrics".to_string());
+        suggestions.push(format!(
+            "put {sample_page} 0 hello; del {sample_page} 0 1; compact"
+        ));
+    }
+    suggestions
+}
+
+fn normalize_suggestions(raw: Vec<String>, fallback: Vec<String>, last_command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut sources = raw;
+    sources.extend(fallback);
+    for s in sources {
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() || trimmed == last_command {
+            continue;
+        }
+        if seen.insert(trimmed.clone()) {
+            out.push(trimmed);
+        }
+        if out.len() == 3 {
+            break;
+        }
+    }
+    while out.len() < 3 {
+        out.push("state".to_string());
+    }
+    out
 }
 
 fn print_suggestions(state: &ReplState) {
     if state.suggestions.is_empty() {
         return;
     }
-    let descs = |cmd: &str| -> &str {
+    let mode = match state.suggestion_mode {
+        SuggestionMode::Single => "single",
+        SuggestionMode::Sequence => "sequence",
+    };
+    println!("Suggestions ({mode} mode, toggle with `suggest`):");
+    let descs = |cmd: &str| -> String {
+        if cmd.contains(';') {
+            let steps: Vec<String> = cmd
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .take(3)
+                .map(command_desc)
+                .collect();
+            return steps.join(" -> ");
+        }
         if cmd.starts_with("get ") {
-            return "read the page";
+            return "read the page".to_string();
+        }
+        if cmd.starts_with("get-raw ") {
+            return "read full page bytes".to_string();
+        }
+        if cmd.starts_with("del ") {
+            return "zero out a byte range".to_string();
+        }
+        if cmd.starts_with("put-random ") {
+            return "insert many random strings".to_string();
+        }
+        if cmd == "compact" {
+            return "rewrite WAL to live data".to_string();
         }
         if cmd.starts_with("put ") && cmd.contains("updated") {
-            return "overwrite with new data";
+            return "overwrite with new data".to_string();
         }
         if cmd.starts_with("put ") && cmd.contains("new-data") {
-            return "overwrite with new data";
+            return "overwrite with new data".to_string();
         }
         if cmd.starts_with("put ") && cmd.contains("Hello") {
-            return "write data to the page";
+            return "write data to the page".to_string();
         }
         if cmd.starts_with("put ") {
-            return "write to a page";
+            return "write to a page".to_string();
         }
         if cmd == "refresh" {
-            return "advance read_point to VDL";
+            return "advance read_point to VDL".to_string();
         }
         if cmd.starts_with("node ") {
-            return "switch compute node";
+            return "switch compute node".to_string();
         }
         if cmd == "state" {
-            return "show durability watermarks";
+            return "show durability watermarks".to_string();
+        }
+        if cmd == "metrics" {
+            return "show runtime metrics".to_string();
+        }
+        if cmd.starts_with("suggest ") {
+            return "switch suggestion mode".to_string();
         }
         if cmd.starts_with("bg stop") {
-            return "stop the background worker";
+            return "stop the background worker".to_string();
         }
         if cmd == "bg list" {
-            return "show running workers";
+            return "show running workers".to_string();
         }
         if cmd.starts_with("bg ") {
-            return "start background worker";
+            return "start background worker".to_string();
         }
-        ""
+        "".to_string()
     };
     for (i, cmd) in state.suggestions.iter().enumerate() {
         let desc = descs(cmd);
@@ -896,6 +1615,49 @@ fn print_suggestions(state: &ReplState) {
             println!("  [{}] {}{}\u{2014} {}", i + 1, cmd, " ".repeat(pad), desc);
         }
     }
+}
+
+fn command_desc(cmd: &str) -> String {
+    if cmd.starts_with("put-random ") {
+        return "insert random data".to_string();
+    }
+    if cmd.starts_with("get-raw ") {
+        return "inspect page bytes".to_string();
+    }
+    if cmd.starts_with("get ") {
+        return "read page".to_string();
+    }
+    if cmd.starts_with("put ") {
+        return "write page".to_string();
+    }
+    if cmd.starts_with("del ") {
+        return "delete range".to_string();
+    }
+    if cmd.starts_with("clear-page ") {
+        return "clear full page".to_string();
+    }
+    if cmd == "compact" {
+        return "compact WAL".to_string();
+    }
+    if cmd == "clear" {
+        return "clear database".to_string();
+    }
+    if cmd == "refresh" {
+        return "sync read point".to_string();
+    }
+    if cmd.starts_with("node ") {
+        return "switch node".to_string();
+    }
+    if cmd == "state" {
+        return "show state".to_string();
+    }
+    if cmd == "metrics" {
+        return "show metrics".to_string();
+    }
+    if cmd.starts_with("bg ") {
+        return "manage background worker".to_string();
+    }
+    cmd.to_string()
 }
 
 async fn handle_bg_command(parts: &[&str], state: &mut ReplState) -> CommandOutcome {

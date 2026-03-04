@@ -65,7 +65,13 @@ The viz-repl is a full interactive concurrency demo with two compute nodes, cont
 
 ```
 put <page> <offset> <text>          Write to a page
+put-random <count>                  Write random strings to consecutive pages
 get <page>                          Read a page
+get-raw <page>                      Read a full page as hex/ascii
+del <page> <offset> <len>           Zero out a byte range on a page
+clear-page <page>                   Zero out an entire page
+compact                             Rewrite durable state into a fresh WAL
+clear                               Delete all persisted data for this REPL
 refresh                             Advance read_point to latest VDL
 node A|B                            Switch active compute node
 state                               Show durability watermarks
@@ -75,9 +81,12 @@ bg stop <node>                      Stop background worker
 bg list                             Show running workers
 viz on|off                          Toggle visualization
 delay <ms>                          Set step delay
+suggest single|sequence             Toggle suggestion style
 1, 2, 3                             Run suggested command
 quit                                Exit
 ```
+
+Commands can be chained in one input line with `;` (for example: `node B; refresh; get 1`).
 
 ### Multi-node
 
@@ -93,17 +102,22 @@ B> get 1            # succeeds — sees "Hello"
 
 ### Suggestions
 
-After each command, numbered shortcuts are displayed. Type `1`, `2`, or `3` to run one:
+Suggestions are shown immediately at startup in **single** mode, and after each command.
+Type `suggest` to see current mode, `suggest single` or `suggest sequence` to switch.
+Type `1`, `2`, or `3` to run a suggestion:
 
 ```
 A> put 1 0 Hello
   [1] get 1                 — read the page
-  [2] put 1 0 updated       — overwrite with new data
-  [3] node B                — switch compute node
+  [2] del 1 0 1             — zero out a byte range
+  [3] compact               — rewrite WAL to live data
 A> 1
->>> get 1
+>>> suggested: get 1
 "Hello"
 ```
+
+In sequence mode, each suggestion is a semicolon-delimited mini-workflow (for example:
+`get 1; del 1 0 1; get-raw 1`) and the description shows each step intent.
 
 ### Background workers
 

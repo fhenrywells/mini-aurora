@@ -126,3 +126,89 @@ async fn crash_recovery_via_sigterm() {
         );
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn crash_recovery_many_puts_reconstruct_from_wal() {
+    let dir = TempDir::new().unwrap();
+    let wal_path = dir.path().join("crash_many.wal");
+    let wal_path_str = wal_path.to_str().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mini-aurora"))
+        .args(["crash-writer", wal_path_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Failed to spawn mini-aurora crash-writer");
+
+    let stdout = child.stdout.take().unwrap();
+    let target_vdl = 20u64;
+
+    let vdl_reached = {
+        let mut reader = BufReader::new(stdout);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut reached = false;
+        let mut line = String::new();
+
+        loop {
+            if Instant::now() > deadline {
+                panic!("Timed out waiting for crash-writer to reach VDL={target_vdl}");
+            }
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if line.trim() == format!("VDL={target_vdl}") {
+                        reached = true;
+                        break;
+                    }
+                }
+                Err(e) => panic!("Error reading crash-writer stdout: {e}"),
+            }
+        }
+        reached
+    };
+
+    assert!(
+        vdl_reached,
+        "crash-writer exited before reaching VDL={target_vdl}"
+    );
+
+    let pid = child.id();
+    Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("Failed to send SIGTERM to crash-writer");
+    child.wait().expect("crash-writer did not exit after SIGTERM");
+
+    let storage = Arc::new(StorageEngine::open(&wal_path).expect("Recovery failed"));
+    let state = storage
+        .get_durability_state()
+        .await
+        .expect("get_durability_state failed");
+    assert!(
+        state.vdl >= target_vdl,
+        "Expected VDL >= {target_vdl} after recovery, got VDL={}",
+        state.vdl
+    );
+
+    let compute = ComputeEngine::new(storage, 256);
+    compute
+        .refresh_read_point()
+        .await
+        .expect("refresh_read_point failed");
+
+    for page_id in 1u64..=target_vdl {
+        let page = compute
+            .get(page_id)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to read page {page_id} after recovery: {e}"));
+        let expected = format!("page-{page_id}");
+        let actual = std::str::from_utf8(&page[..expected.len()])
+            .expect("Page content is not valid UTF-8");
+        assert_eq!(
+            actual, expected,
+            "Page {page_id} has wrong content after recovery"
+        );
+    }
+}

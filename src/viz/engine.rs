@@ -164,6 +164,12 @@ impl VizStorageEngine {
         drop(inner);
         self.emit(event);
     }
+
+    /// Return all page IDs that currently have durable entries.
+    pub fn durable_page_ids(&self) -> Vec<PageId> {
+        let inner = self.inner.lock().unwrap();
+        inner.page_index.keys().copied().collect()
+    }
 }
 
 #[async_trait]

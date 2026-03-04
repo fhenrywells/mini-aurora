@@ -12,7 +12,6 @@ pub struct MetricsCollector {
     buffer_pool_hits: u64,
     buffer_pool_misses: u64,
     materialize_count: u64,
-    materialize_total_us: u64,
     wal_bytes_written: u64,
     vcl: u64,
     vdl: u64,
@@ -52,7 +51,6 @@ impl MetricsCollector {
             buffer_pool_hits: 0,
             buffer_pool_misses: 0,
             materialize_count: 0,
-            materialize_total_us: 0,
             wal_bytes_written: 0,
             vcl: 0,
             vdl: 0,
@@ -129,11 +127,6 @@ impl MetricsCollector {
             uptime_secs: self.start_time.elapsed().as_secs_f64(),
         }
     }
-
-    /// Reset all counters and restart the clock.
-    pub fn reset(&mut self) {
-        *self = Self::new();
-    }
 }
 
 impl fmt::Display for MetricsSummary {
@@ -144,14 +137,21 @@ impl fmt::Display for MetricsSummary {
         } else {
             0
         };
+        let bp_total = self.buffer_pool_hits + self.buffer_pool_misses;
+        let bp_hit_pct = if bp_total > 0 {
+            (self.buffer_pool_hits as f64 / bp_total as f64 * 100.0) as u64
+        } else {
+            0
+        };
         let wal_kb = self.wal_bytes_written / 1024;
         write!(
             f,
-            "Writes: {} | Reads: {} | Cache hit: {}% | Materializations: {}\n\
+            "Writes: {} | Reads: {} | Page cache hit: {}% | Buffer pool hit: {}% | Materializations: {}\n\
              WAL: {} KB | VCL={} VDL={} | Uptime: {:.1}s",
             self.write_count,
             self.read_count,
             cache_pct,
+            bp_hit_pct,
             self.materialize_count,
             wal_kb,
             self.vcl,
